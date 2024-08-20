@@ -1,4 +1,4 @@
-module github.com/imclaren/dblocker
+module github.com/calmdocs/dblocker
 
 go 1.22.5
 
