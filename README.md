@@ -36,15 +36,15 @@ func main() {
         panic(err)
     }
 
-    // Allow user 123 to get the files using ReadGetDB.
-    // Concurrent read access for user 123 is permitted.
+    // Allow user 123 to get a list of files from the database using ReadGetDB.
+    // Concurrent read access to the database for user 123 is permitted.
     files, err := getFiles(ctx, dbStore, userID)
     if err != nil {
         panic(err)
     }
     
-    // Allow user 123 to update the file using RWGetDB
-    // No concurrent access for that user is permitted.
+    // Allow user 123 to update a database entry using RWGetDB.
+    // No concurrent access to the database for that user is permitted.
     err = updateFileName(ctx, userID, fileID, fileName)
     if err != nil {
         panic(err)
