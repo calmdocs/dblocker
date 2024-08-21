@@ -2,7 +2,7 @@
 
 [![godoc](https://godoc.org/github.com/calmdocs/dblocker?status.svg)](https://godoc.org/github.com/calmdocs/dblocker)
 
-Golang database locker.  Locks a shared database session for each "user" behind a RWMutex. 
+Golang database locker.  Locks a shared database session for each "user" or "id" behind a RWMutex. 
 
 Works with [sqlite](github.com/mattn/go-sqlite3), [postgres](github.com/lib/pq), and [mysql](github.com/go-sql-driver/mysql) by default.  Other databases can be easily added by using a custom [connectDBFunc](https://godoc.org/github.com/calmdocs/dblocker).
 
@@ -14,11 +14,11 @@ The ReadGetDBx and RWGetDBx functions return a shared [sqlx](github.com/jmoiron/
 
 Allows:
 - simple access to sqlite without worrying about crashes due to concurrently reads and writes from multiple databse sessions.
-- a simple mechanism to ensure that only one "user" accesses the database at any time, as if access for that "user" is locked behind a RWMutex.
-- database access such as multiple cuncurrent datbase select requests without also requiring the use of [pgbouncer](https://www.pgbouncer.org) or similar session access caching tools.
-- multiple sql commands (and other go code) to be run for a "user", while not worrying about concurrent access for that "user", and without needing to run all of the database commands in one database transaction.
+- a simple mechanism to ensure that only one "user" or "id" accesses the database at any time, as if access for that "user" or "id" is locked behind a RWMutex.
+- database access such as multiple cuncurrent datbase select requests without also requiring the use of [pgbouncer](https://www.pgbouncer.org) for postgres or similar session access caching tools.
+- multiple sql commands (and other go code) to be run for a "user" or "id", while not worrying about concurrent access for that "user" or "id", and without needing to run all of the database commands in one database transaction.
 
-If you use a custom [connectDBFunc](https://godoc.org/github.com/calmdocs/dblocker), you can also implement simple database sharding based on the id that you provide.
+If you use a custom [connectDBFunc](https://godoc.org/github.com/calmdocs/dblocker), you can also implement simple database sharding based on the "user" or "id" that you provide.
 
 ## Example
 ```
@@ -33,6 +33,9 @@ func main() {
     ctx, cancel := context.WithCancel(context.Backgound())
     defer cancel()
 
+    // Create a dbStore
+    // with a default unlockTimeout for waiting for access to the database of 2 minutes, and
+    // with a default statemenTimeout for database sessions of 4 minutes (where the database supports statement timeouts).
     dbStore, err := dblocker.New(ctx, driverName, dataSourceName, debug)
     if err != nil {
         panic(err)
