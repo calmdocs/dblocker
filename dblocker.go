@@ -2,6 +2,7 @@ package dblocker
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sync"
 	"time"
@@ -120,25 +121,53 @@ func NewWithConnectDBFuncAndTimeouts(
 	}, nil
 }
 
-// RWGetDB returns a shared copy of a database session (*sqlx.DB) for the specified id.
+// RWGetDB returns a shared copy of a database session (*sql.DB) for the specified id.
 // RWGetDB acts like Lock() for a RWMutex for the specified id.
 // All other RWGetDB, RWGetDBWithTimeout, and ReadDB function calls will wait for access to the database for the specified id until the returned cancel() function is called.
-func (s *Store) RWGetDB(id interface{}, ctx context.Context, tag string) (cancel context.CancelFunc, db *sqlx.DB, err error) {
+func (s *Store) RWGetDB(id interface{}, ctx context.Context, tag string) (cancel context.CancelFunc, db *sql.DB, err error) {
+	cancel, sqlxDB, err := s.waitGetDB(id, "rw", ctx, tag, nil)
+	return cancel, sqlxDB.DB, err
+}
+
+// RWGetDB returns a shared copy of a database session (*sqlx.DB) for the specified id.
+// github.com/jmoiron/sqlx is a library which provides a set of extensions on go's standard database/sql library.
+// RWGetDB acts like Lock() for a RWMutex for the specified id.
+// All other RWGetDB, RWGetDBWithTimeout, and ReadDB function calls will wait for access to the database for the specified id until the returned cancel() function is called.
+func (s *Store) RWGetDBx(id interface{}, ctx context.Context, tag string) (cancel context.CancelFunc, db *sqlx.DB, err error) {
 	return s.waitGetDB(id, "rw", ctx, tag, nil)
 }
 
-// RWGetDBWithTimeout returns a new database session (*sqlx.DB) for the specified id with a custom session timeout.
+// RWGetDBWithTimeout returns a new database session (*sql.DB) for the specified id with a custom session timeout.
 // RWGetDBWithTimeout acts like Lock() for a RWMutex for the specified id.
 // All other RWGetDB, RWGetDBWithTimeout, and ReadDB function calls will wait for access to the database for the specified id until the returned cancel() function is called.
-func (s *Store) RWGetDBWithTimeout(id interface{}, ctx context.Context, tag string, statementTimeout *time.Duration) (cancel context.CancelFunc, db *sqlx.DB, err error) {
+func (s *Store) RWGetDBWithTimeout(id interface{}, ctx context.Context, tag string, statementTimeout *time.Duration) (cancel context.CancelFunc, db *sql.DB, err error) {
+	cancel, sqlxDB, err := s.waitGetDB(id, "rwseparate", ctx, tag, statementTimeout)
+	return cancel, sqlxDB.DB, err
+}
+
+// RWGetDBWithTimeout returns a new database session (*sqlx.DB) for the specified id with a custom session timeout.
+// github.com/jmoiron/sqlx is a library which provides a set of extensions on go's standard database/sql library.
+// RWGetDBWithTimeout acts like Lock() for a RWMutex for the specified id.
+// All other RWGetDB, RWGetDBWithTimeout, and ReadDB function calls will wait for access to the database for the specified id until the returned cancel() function is called.
+func (s *Store) RWGetDBxWithTimeout(id interface{}, ctx context.Context, tag string, statementTimeout *time.Duration) (cancel context.CancelFunc, db *sqlx.DB, err error) {
 	return s.waitGetDB(id, "rwseparate", ctx, tag, statementTimeout)
 }
 
-// ReadDB returns a shared copy of a database session (*sqlx.DB) for the specified id.
+// ReadDB returns a shared copy of a database session (*sql.DB) for the specified id.
 // ReadDB acts like RLock() for a RWMutex for the specified id.
 // Multiple ReadDB function calls can access the shared database at the same time.
 // All RWGetDB and RWGetDBWithTimeout function calls will wait for access to the database for the specified id until the returned cancel() function is called.
-func (s *Store) ReadGetDB(id interface{}, ctx context.Context, tag string) (cancel context.CancelFunc, db *sqlx.DB, err error) {
+func (s *Store) ReadGetDB(id interface{}, ctx context.Context, tag string) (cancel context.CancelFunc, db *sql.DB, err error) {
+	cancel, sqlxDB, err := s.waitGetDB(id, "read", ctx, tag, nil)
+	return cancel, sqlxDB.DB, err
+}
+
+// ReadDB returns a shared copy of a database session (*sqlx.DB) for the specified id.
+// github.com/jmoiron/sqlx is a library which provides a set of extensions on go's standard database/sql library.
+// ReadDB acts like RLock() for a RWMutex for the specified id.
+// Multiple ReadDB function calls can access the shared database at the same time.
+// All RWGetDB and RWGetDBWithTimeout function calls will wait for access to the database for the specified id until the returned cancel() function is called.
+func (s *Store) ReadGetDBx(id interface{}, ctx context.Context, tag string) (cancel context.CancelFunc, db *sqlx.DB, err error) {
 	return s.waitGetDB(id, "read", ctx, tag, nil)
 }
 
