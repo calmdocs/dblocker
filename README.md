@@ -4,9 +4,11 @@
 
 Golang database locker.  Locks a shared database session for each "user" behind a RWMutex. 
 
-Works with [sqlite](github.com/mattn/go-sqlite3), [postgres](github.com/lib/pq), and [mysql](github.com/go-sql-driver/mysql) by default.  Other databases can be easily added by using a custom connectDBFunc.
+Works with [sqlite](github.com/mattn/go-sqlite3), [postgres](github.com/lib/pq), and [mysql](github.com/go-sql-driver/mysql) by default.  Other databases can be easily added by using a custom [connectDBFunc](https://godoc.org/github.com/calmdocs/dblocker).
 
-The ReadGetDB and RWGetDB functions return a shared db/sql database.  The ReadGetDBx and RWGetDBx functions return a [sqlx databse](github.com/jmoiron/sqlx).  [sqlx](github.com/jmoiron/sqlx) is a library which provides a set of extensions on go's standard database/sql library.
+The ReadGetDB and RWGetDB functions return a shared [db/sql](https://pkg.go.dev/database/sql) database.  
+
+The ReadGetDBx and RWGetDBx functions return a [sqlx](github.com/jmoiron/sqlx) databse.  [sqlx](github.com/jmoiron/sqlx) is a library which provides a set of extensions on go's standard database/sql library.
 
 ## Why?
 
@@ -51,7 +53,7 @@ func main() {
         panic(err)
     }
 
-    // Run 20 concurrent reads and update goroutines
+    // Run 20 concurrent goroutines
     // Using new database connections instead of dblocker here would break
     // sqlite due to concurrent reads and writes and
     // postgres due to too many concurrent database connections
@@ -69,7 +71,6 @@ func main() {
             }
         }
     }
-
 }
 
 func getFiles(ctx context.Context, dbStore *dblocker.Store, userID string) (files []File, err error) {
