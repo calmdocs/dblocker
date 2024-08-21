@@ -6,9 +6,9 @@ Golang database locker.  Locks a shared database session for each "user" behind 
 
 Works with [sqlite](github.com/mattn/go-sqlite3), [postgres](github.com/lib/pq), and [mysql](github.com/go-sql-driver/mysql) by default.  Other databases can be easily added by using a custom [connectDBFunc](https://godoc.org/github.com/calmdocs/dblocker).
 
-The ReadGetDB and RWGetDB functions return a shared [db/sql](https://pkg.go.dev/database/sql) database.  
+The ReadGetDB and RWGetDB functions return a shared [database/sql](https://pkg.go.dev/database/sql) database.  
 
-The ReadGetDBx and RWGetDBx functions return a [sqlx](github.com/jmoiron/sqlx) databse.  [sqlx](github.com/jmoiron/sqlx) is a library which provides a set of extensions on go's standard database/sql library.
+The ReadGetDBx and RWGetDBx functions return a shared [sqlx](github.com/jmoiron/sqlx) databse.  [sqlx](github.com/jmoiron/sqlx) is a library which provides a set of extensions on go's standard database/sql library.
 
 ## Why?
 
