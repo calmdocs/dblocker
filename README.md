@@ -13,7 +13,7 @@ The ReadGetDB and RWGetDB functions return a shared [database/sql](https://pkg.g
 Allows:
 - simple access to sqlite without worrying about crashes due to concurrently reads and writes from multiple databse sessions.
 - a simple mechanism to ensure that only one "user" or "id" accesses the database at any time, as if access for that "user" or "id" is locked behind a RWMutex.
-- database access such as multiple cuncurrent datbase select requests without also requiring the use of [pgbouncer](https://www.pgbouncer.org) for postgres or similar session access caching tools.
+- database access such as multiple cuncurrent database select requests without also requiring the use of [pgbouncer](https://www.pgbouncer.org) for postgres or similar session access caching tools.
 - multiple sql commands (and other go code) to be run for a "user" or "id", while not worrying about concurrent access for that "user" or "id", and without needing to run all of the database commands in one database transaction.
 
 If you use a custom [connectDBFunc](https://godoc.org/github.com/calmdocs/dblocker), you can also implement simple database sharding based on the "user" or "id" that you provide.
