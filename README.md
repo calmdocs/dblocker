@@ -22,13 +22,27 @@ If you use a custom [connectDBFunc](https://godoc.org/github.com/calmdocs/dblock
 
 ## Example
 ```
+import (
+    "fmt"
+    "strconv"
+
+    "github.com/calmdocs/dblocker"
+    "github.com/google/uuid"
+)
+
+type File struct {
+	ID      int64   `db:"id"`
+    UserID  int64   `db:"user_id"`
+	Name    string  `db:"name"`
+}
+
 func main() {
     debug := false
     driverName := sqlite3
     dataSourceName := "/path/to/sql.db"
     userID := "123"
-    fileID := 27
-    fileName := "newFile.txt"
+    oldFileName := "file 27"
+    newFileName := "newFile.txt"
 
     ctx, cancel := context.WithCancel(context.Backgound())
     defer cancel()
@@ -41,7 +55,13 @@ func main() {
         panic(err)
     }
 
-    // Allow user 123 to get a list of files from the database using ReadGetDB.
+    // Create database table using RWGetDBx and insert 50 rows.
+    err = createTableAndInsertRows(ctx, dbStore, userID)
+    if err != nil {
+        panic(err)
+    }
+
+    // Allow user 123 to get a list of files from the database using ReadGetDBx.
     // Concurrent read access to the database for user 123 is permitted.
     files, err := getFiles(ctx, dbStore, userID)
     if err != nil {
@@ -49,9 +69,9 @@ func main() {
     }
     fmt.Println(files)
     
-    // Allow user 123 to update a database entry using RWGetDB.
+    // Allow user 123 to update a database entry using RWGetDBx.
     // No concurrent access to the database for that user is permitted.
-    err = updateFileName(ctx, userID, fileID, fileName)
+    err = updateFileName(ctx, userID, oldFileName, newFileName)
     if err != nil {
         panic(err)
     }
@@ -68,12 +88,47 @@ func main() {
             }
             fmt.Println(files)
 
-            err = updateFileName(ctx, userID, fileID, fileName)
+            err = updateFileName(ctx, userID, oldFileName, newFileName)
             if err != nil {
                 panic(err)
             }
         }
     }
+}
+
+func createTableAndInsertRows(ctx context.Context, dbStore *dblocker.Store, userID string) (err error) {
+
+    // Get exclusive access the shared database session
+    cancelDB, db, err := dbStore.RWGetDBx(userID, ctx, "create database")
+    if err != nil {
+        return err
+    }
+    defer cancelDB()
+
+    // Create table if it does not exist
+    _, err = db.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS files (id TEXT, user_id TEXT, file_id TEXT, name TEXT);")
+    if err != nil {
+        return err
+    }
+
+    // Insert 50 rows into the database
+    for i := 1; i <= 50; i++ {
+
+		// Create new fid using uuidv7
+		newUUID, err := uuid.NewV7()
+		if err != nil {
+			return err
+		}
+        _, err = db.ExecContext(
+            ctx,
+            db.Rebind("insert into files(id, user_id, name) values(?, ?, ?)"),
+            newUUID.String(),
+            userID,
+            fmt.Sprintf("file %d", i),
+        )
+    }
+
+    return err
 }
 
 func getFiles(ctx context.Context, dbStore *dblocker.Store, userID string) (files []File, err error) {
@@ -97,7 +152,7 @@ func getFiles(ctx context.Context, dbStore *dblocker.Store, userID string) (file
     return files, nil
 }
 
-func updateFileName(ctx context.Context, userID string, fileID int64, fileName string) (err error) {
+func updateFileName(ctx context.Context, userID string, oldFileName string, newFileName string) (err error) {
     
     // Get exclusive access the shared database session
     cancelDB, db, err := dbStore.RWGetDBx(userID, ctx, "update file name")
@@ -108,9 +163,10 @@ func updateFileName(ctx context.Context, userID string, fileID int64, fileName s
 
     _, err = db.ExecContext(
         ctx,
-        db.Rebind("update files set name = ? WHERE file_id = ?"),
-        fileName,
-        fileID,
+        db.Rebind("update files set name = ? WHERE user_id = ? AND name = ?"),
+        newFileName,
+        userID,
+        oldFileName,
     )
     return err
 }
