@@ -32,7 +32,7 @@ import (
 
 type File struct {
 	ID      int64   `db:"id"`
-    UserID  int64   `db:"user_id"`
+    	UserID  int64   `db:"user_id"`
 	Name    string  `db:"name"`
 }
 
