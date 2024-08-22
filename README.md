@@ -114,11 +114,12 @@ func createTableAndInsertRows(ctx context.Context, dbStore *dblocker.Store, user
     // Insert 50 rows into the database
     for i := 1; i <= 50; i++ {
 
-		// Create new fid using uuidv7
-		newUUID, err := uuid.NewV7()
-		if err != nil {
-			return err
-		}
+	// Create new fid using uuidv7
+	newUUID, err := uuid.NewV7()
+	if err != nil {
+		return err
+	}
+	// Insert
         _, err = db.ExecContext(
             ctx,
             db.Rebind("insert into files(id, user_id, name) values(?, ?, ?)"),
