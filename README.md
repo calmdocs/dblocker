@@ -2,7 +2,7 @@
 
 [![godoc](https://godoc.org/github.com/calmdocs/dblocker?status.svg)](https://godoc.org/github.com/calmdocs/dblocker)
 
-Golang database locker.  Locks a shared database session for each "user" or "id" behind what is effectively a RWMutex. 
+Golang database locker.  A simple library to lock a shared database session for each "user" or "id" behind what is effectively a RWMutex. 
 
 Works with [sqlite](github.com/mattn/go-sqlite3), [postgres](github.com/lib/pq), and [mysql](github.com/go-sql-driver/mysql) by default.  Other databases can be easily added by using a custom [connectDBFunc](https://godoc.org/github.com/calmdocs/dblocker).
 
