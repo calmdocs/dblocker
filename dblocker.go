@@ -126,6 +126,9 @@ func NewWithConnectDBFuncAndTimeouts(
 // All other RWGetDB, RWGetDBWithTimeout, and ReadDB function calls will wait for access to the database for the specified id until the returned cancel() function is called.
 func (s *Store) RWGetDB(id interface{}, ctx context.Context, tag string) (cancel context.CancelFunc, db *sql.DB, err error) {
 	cancel, sqlxDB, err := s.waitGetDB(id, "rw", ctx, tag, nil)
+	if err != nil {
+		return cancel, nil, err
+	}
 	return cancel, sqlxDB.DB, err
 }
 
@@ -142,6 +145,9 @@ func (s *Store) RWGetDBx(id interface{}, ctx context.Context, tag string) (cance
 // All other RWGetDB, RWGetDBWithTimeout, and ReadDB function calls will wait for access to the database for the specified id until the returned cancel() function is called.
 func (s *Store) RWGetDBWithTimeout(id interface{}, ctx context.Context, tag string, statementTimeout *time.Duration) (cancel context.CancelFunc, db *sql.DB, err error) {
 	cancel, sqlxDB, err := s.waitGetDB(id, "rwseparate", ctx, tag, statementTimeout)
+	if err != nil {
+		return cancel, nil, err
+	}
 	return cancel, sqlxDB.DB, err
 }
 
@@ -159,6 +165,9 @@ func (s *Store) RWGetDBxWithTimeout(id interface{}, ctx context.Context, tag str
 // All RWGetDB and RWGetDBWithTimeout function calls will wait for access to the database for the specified id until the returned cancel() function is called.
 func (s *Store) ReadGetDB(id interface{}, ctx context.Context, tag string) (cancel context.CancelFunc, db *sql.DB, err error) {
 	cancel, sqlxDB, err := s.waitGetDB(id, "read", ctx, tag, nil)
+	if err != nil {
+		return cancel, nil, err
+	}
 	return cancel, sqlxDB.DB, err
 }
 
@@ -173,13 +182,18 @@ func (s *Store) ReadGetDBx(id interface{}, ctx context.Context, tag string) (can
 
 func (s *Store) waitGetDB(id interface{}, accessType string, parentCtx context.Context, tag string, statementTimeout *time.Duration) (cancel context.CancelFunc, db *sqlx.DB, err error) {
 
-	// Create context
+	// Create context.
+	// ctxCancel is a local copy for the goroutine below: the named return
+	// value cancel is written by every return statement, which would race
+	// with the goroutine reading it.
 	var ctx context.Context
+	var ctxCancel context.CancelFunc
 	if s.UnlockTimeout == nil {
-		ctx, cancel = context.WithCancel(parentCtx)
+		ctx, ctxCancel = context.WithCancel(parentCtx)
 	} else {
-		ctx, cancel = context.WithTimeout(parentCtx, *s.UnlockTimeout)
+		ctx, ctxCancel = context.WithTimeout(parentCtx, *s.UnlockTimeout)
 	}
+	cancel = ctxCancel
 
 	// Check accessType
 	switch accessType {
@@ -187,9 +201,7 @@ func (s *Store) waitGetDB(id interface{}, accessType string, parentCtx context.C
 	case "rwseparate":
 	case "read":
 	default:
-		if cancel != nil {
-			cancel()
-		}
+		ctxCancel()
 		return nil, nil, fmt.Errorf("unknown access type error: %s", accessType)
 	}
 
@@ -203,13 +215,9 @@ func (s *Store) waitGetDB(id interface{}, accessType string, parentCtx context.C
 
 		select {
 		case <-s.Ctx.Done():
-			if cancel != nil {
-				cancel()
-			}
+			ctxCancel()
 		case <-ctx.Done():
-			if cancel != nil {
-				cancel()
-			}
+			ctxCancel()
 		}
 	}()
 
@@ -303,6 +311,18 @@ func (s *Store) waitGetDB(id interface{}, accessType string, parentCtx context.C
 				cancel()
 			}
 			return nil, nil, ctx.Err()
+		}
+
+		// A nil db means the group's database connect failed (see
+		// drainFailedGroup) — return the real connect error.
+		// Reading g.connectErr without the store lock is safe: it is
+		// written once before any nil db is sent on g.dbCh, so the
+		// channel receive above orders the read after the write.
+		if db == nil {
+			if cancel != nil {
+				cancel()
+			}
+			return nil, nil, fmt.Errorf("dblocker connect error: %w", g.connectErr)
 		}
 	default:
 		return nil, nil, fmt.Errorf("unknown access type error: %s", accessType)

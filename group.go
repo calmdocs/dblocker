@@ -1,6 +1,8 @@
 package dblocker
 
 import (
+	"time"
+
 	"github.com/jmoiron/sqlx"
 )
 
@@ -9,6 +11,7 @@ type Group struct {
 	requestCount int64
 
 	DB            *sqlx.DB
+	connectErr    error
 	rwRequestCh   chan Request
 	readRequestCh chan Request
 	dbCh          chan *sqlx.DB
@@ -21,16 +24,37 @@ func (s *Store) startGroup(id interface{}, g *Group) {
 	rwDoneCh := make(chan bool)
 	readDoneCh := make(chan bool)
 
-	// Connect to the database
-	s.Lock()
-	g.DB = connectDBAndWait(
+	// Connect to the database WITHOUT holding the store mutex.  Holding it
+	// here would block every waitGetDB call (for any id) on s.Lock — a plain
+	// mutex wait that ignores contexts and the UnlockTimeout — so a database
+	// that stays unopenable would wedge the entire store indefinitely.
+	//
+	// The connect retry window is kept shorter than UnlockTimeout so that
+	// waiters receive the real connect error (via the nil db handed out by
+	// drainFailedGroup) rather than a generic context deadline.
+	maxWait := time.Minute
+	if s.UnlockTimeout != nil {
+		maxWait = *s.UnlockTimeout / 2
+	}
+	db, err := connectDBAndWait(
 		s.Ctx,
 		id,
 		s.connectDBFunc,
 		s.DriverName,
 		s.DataSourceName,
 		s.StatementTimeout,
+		maxWait,
 	)
+	if err != nil {
+		// Surface the connect error to every waiter, then delete the group
+		// so the next request dials a fresh connection.
+		g.connectErr = err
+		s.drainFailedGroup(id, g, rwDoneCh, readDoneCh)
+		return
+	}
+
+	s.Lock()
+	g.DB = db
 	s.Unlock()
 
 	for {
@@ -170,6 +194,43 @@ func (s *Store) startGroup(id interface{}, g *Group) {
 					}
 				}()
 			}
+		}
+	}
+}
+
+// drainFailedGroup serves a group whose database connect failed.  Requests
+// are accepted and handed a nil database (waitGetDB translates that into
+// g.connectErr) until no requests remain, then the group is deleted so the
+// next request reconnects from scratch.  The ticker case re-checks the
+// request count when a waiter gives up (context cancelled) without ever
+// taking a request or a nil db from us.
+func (s *Store) drainFailedGroup(id interface{}, g *Group, rwDoneCh, readDoneCh chan bool) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		s.Lock()
+		if g.requestCount == 0 {
+			close(g.rwRequestCh)
+			close(g.readRequestCh)
+			close(g.dbCh)
+			close(rwDoneCh)
+			close(readDoneCh)
+
+			delete(s.m, id)
+
+			s.Unlock()
+			return
+		}
+		s.Unlock()
+
+		select {
+		case <-s.Ctx.Done():
+			return
+		case <-g.rwRequestCh:
+		case <-g.readRequestCh:
+		case g.dbCh <- nil:
+		case <-ticker.C:
 		}
 	}
 }

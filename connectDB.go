@@ -46,6 +46,10 @@ func DefaultConnectDBFunc(ctx context.Context, id interface{}, driverName, dataS
 	return db, err
 }
 
+// connectDBAndWait retries connectDBFunc every 2 seconds until it succeeds,
+// maxWait elapses, or ctx is cancelled.  On failure the last connect error is
+// returned so callers can surface the real cause (e.g. "unable to open
+// database file") instead of retrying forever and never reporting anything.
 func connectDBAndWait(
 	ctx context.Context,
 	id interface{},
@@ -53,30 +57,32 @@ func connectDBAndWait(
 	driverName string,
 	dataSourceName string,
 	statementTimeout *time.Duration,
-) (db *sqlx.DB) {
+	maxWait time.Duration,
+) (db *sqlx.DB, err error) {
 
 	idleDuration := 2 * time.Second
 	idleDelay := time.NewTimer(idleDuration)
 	defer idleDelay.Stop()
 
-	var err error
-	done := false
-	for !done {
-		done = true
-
+	deadline := time.Now().Add(maxWait)
+	for {
 		db, err = connectDBFunc(ctx, id, driverName, dataSourceName, statementTimeout)
-		if err != nil {
-			done = false
+		if err == nil {
+			return db, nil
+		}
 
-			fmt.Println("dbLocker connect error:", err.Error())
+		fmt.Println("dbLocker connect error:", err.Error())
 
-			idleDelay.Reset(idleDuration)
-			select {
-			case <-ctx.Done():
-				return
-			case <-idleDelay.C:
-			}
+		// Give up if the next retry would land past the deadline
+		if time.Now().Add(idleDuration).After(deadline) {
+			return nil, err
+		}
+
+		idleDelay.Reset(idleDuration)
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-idleDelay.C:
 		}
 	}
-	return db
 }
