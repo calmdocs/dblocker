@@ -3,6 +3,7 @@ package dblocker
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -310,5 +311,41 @@ func TestNewWithOptionsValidation(t *testing.T) {
 	}
 	if _, err := NewWithOptions(parentCtx, Options{DriverName: "nosuchdb", StatementTimeout: &statementTimeout}); err == nil {
 		t.Fatal("expected error for unknown database type")
+	}
+}
+
+// TestSeparateSessionClosedOnCancel checks that the separate session pool
+// opened by RWGetDBWithTimeout is closed once its cancel function is called,
+// so separate sessions do not leak connections.
+func TestSeparateSessionClosedOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, err := NewWithOptions(ctx, Options{DriverName: "mock"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cancelDB, db, err := s.RWGetDBWithTimeout("user-1", ctx, "separate", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Ping(); err != nil {
+		t.Fatalf("separate session unusable before cancel: %v", err)
+	}
+	cancelDB()
+
+	// The close runs in a goroutine triggered by the cancelled context, so
+	// poll briefly for the pool to report closed.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := db.Ping()
+		if err != nil && strings.Contains(err.Error(), "closed") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("separate session still open after cancel (ping err: %v)", err)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

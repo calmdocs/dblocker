@@ -356,6 +356,7 @@ func (s *Store) RWGetDBx(id interface{}, ctx context.Context, tag string) (cance
 
 // RWGetDBWithTimeout returns a new database session (*sql.DB) for the specified id with a custom session timeout.
 // RWGetDBWithTimeout acts like Lock() for a RWMutex for the specified id.
+// The separate session is closed automatically when the returned cancel() function is called (or when the request context is cancelled).
 // All other RWGetDB, RWGetDBWithTimeout, and ReadDB function calls will wait for access to the database for the specified id until the returned cancel() function is called.
 func (s *Store) RWGetDBWithTimeout(id interface{}, ctx context.Context, tag string, statementTimeout *time.Duration) (cancel context.CancelFunc, db *sql.DB, err error) {
 	cancel, sqlxDB, err := s.waitGetDB(id, "rwseparate", ctx, tag, statementTimeout)
@@ -365,9 +366,10 @@ func (s *Store) RWGetDBWithTimeout(id interface{}, ctx context.Context, tag stri
 	return cancel, sqlxDB.DB, err
 }
 
-// RWGetDBWithTimeout returns a new database session (*sqlx.DB) for the specified id with a custom session timeout.
+// RWGetDBxWithTimeout returns a new database session (*sqlx.DB) for the specified id with a custom session timeout.
 // github.com/jmoiron/sqlx is a library which provides a set of extensions on go's standard database/sql library.
-// RWGetDBWithTimeout acts like Lock() for a RWMutex for the specified id.
+// RWGetDBxWithTimeout acts like Lock() for a RWMutex for the specified id.
+// The separate session is closed automatically when the returned cancel() function is called (or when the request context is cancelled).
 // All other RWGetDB, RWGetDBWithTimeout, and ReadDB function calls will wait for access to the database for the specified id until the returned cancel() function is called.
 func (s *Store) RWGetDBxWithTimeout(id interface{}, ctx context.Context, tag string, statementTimeout *time.Duration) (cancel context.CancelFunc, db *sqlx.DB, err error) {
 	return s.waitGetDB(id, "rwseparate", ctx, tag, statementTimeout)
@@ -539,6 +541,16 @@ func (s *Store) waitGetDB(id interface{}, accessType string, parentCtx context.C
 			return nil, nil, err
 		}
 		s.applyConnLimitsPerID(db)
+
+		// Close the separate session when the request is done.  ctx is
+		// also cancelled when s.Ctx is done (see the goroutine above),
+		// so this covers store shutdown too.  Without this every
+		// RWGetDBWithTimeout call would leak a session pool.
+		sepDB := db
+		go func() {
+			<-ctx.Done()
+			sepDB.Close()
+		}()
 	case "rw", "read":
 
 		// Get shared database connection (wait)
