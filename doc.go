@@ -67,8 +67,12 @@
 //		MaxConnsPerID:  5,
 //	})
 //
-// MaxConnsPerID caps each id's connection pool via database/sql's
-// SetMaxOpenConns.  MaxConns caps concurrent sessions store-wide.
+// MaxConnsPerID caps concurrent sessions for each individual id; MaxConns
+// caps concurrent sessions store-wide.  Both limits gate the handing out
+// of sessions with a semaphore — dblocker never configures or touches the
+// database pool itself.  It only opens the database, provides it, and
+// closes it; to tune a pool (e.g. SetMaxOpenConns), do so in a custom
+// ConnectDBFunc.
 //
 // dblocker is a locker: a session is a single sequential unit of database
 // work, exactly as if it were one transaction.  An RW session acts like a
@@ -76,17 +80,14 @@
 // concurrent reader.  Run a session's commands one after another; to do
 // work concurrently, take concurrent sessions.  Since all database access
 // goes through dblocker and each session runs one command at a time,
-// capping concurrent sessions (MaxConns) caps concurrent database
-// connections in use.  A session holds its MaxConns slot from when access
-// is granted (after any wait for the id's lock) until its cancel function
-// is called.  A request beyond either cap waits, subject to the request
-// context and the UnlockTimeout.
+// capping concurrent sessions caps concurrent database connections in
+// use.  A session holds its slots from when access is granted (after any
+// wait for the id's lock) until its cancel function is called.  A request
+// beyond either cap waits, subject to the request context and the
+// UnlockTimeout.
 //
-// Within the caps, connections are reused rather than churned: a connection
-// freed by one query is handed directly to any waiting request, and
-// otherwise kept open for the id's next request.  The whole pool is closed
-// when the id's last request finishes, so an inactive id holds no
-// connections at all.
+// An id's shared pool is closed when the id's last request finishes, so an
+// inactive id holds no connections at all.
 //
 // # Timeouts
 //

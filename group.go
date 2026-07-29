@@ -16,6 +16,12 @@ type Group struct {
 	rwRequestCh   chan Request
 	readRequestCh chan Request
 	dbCh          chan *sqlx.DB
+
+	// connSem bounds the number of concurrent database sessions for this
+	// id when the Store's MaxConnsPerID > 0 (nil means no limit).  A slot
+	// is held from when access for a session is granted until the
+	// session's cancel function is called (or its context ends).
+	connSem chan struct{}
 }
 
 func (s *Store) startGroup(id interface{}, g *Group) {
@@ -55,9 +61,6 @@ func (s *Store) startGroup(id interface{}, g *Group) {
 		s.drainFailedGroup(id, g, rwDoneCh, readDoneCh)
 		return
 	}
-
-	// Cap this id's total database connection footprint if configured
-	s.applyConnLimitsPerID(db)
 
 	sh.Lock()
 	g.DB = db

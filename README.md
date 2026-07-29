@@ -15,7 +15,7 @@ Allows:
 - a simple mechanism to ensure that only one "user" or "id" writes to the database at any time, as if access for that "user" or "id" is locked behind a RWMutex.
 - database access such as multiple concurrent database select requests without also requiring the use of [pgbouncer](https://www.pgbouncer.org) for postgres or similar session access caching tools.
 - multiple sql commands (and other go code) to be run for a "user" or "id", while not worrying about concurrent access for that "user" or "id", and without needing to run all of the database commands in one database transaction.
-- caps on the number of concurrent database connections for each individual "user" or "id" (`MaxConnsPerID`) and in total across all ids (`MaxConns`).
+- caps on the number of concurrent database sessions — and so connections in use — for each individual "user" or "id" (`MaxConnsPerID`) and in total across all ids (`MaxConns`).
 
 If you use a custom [ConnectDBFunc](https://godoc.org/github.com/calmdocs/dblocker), you can also implement simple database sharding based on the "user" or "id" that you provide.
 
@@ -62,8 +62,8 @@ dbStore, err := dblocker.NewWithOptions(ctx, dblocker.Options{
     DataSourceName:    dsn,
     UnlockTimeout:     &unlockTimeout,
     StatementTimeout:  &statementTimeout,
-    MaxConns:          50, // total concurrent db connection limit across all ids (0 = no limit)
-    MaxConnsPerID:     5,  // concurrent db connection limit for each individual id (0 = no limit)
+    MaxConns:          50, // total concurrent db session limit across all ids (0 = no limit)
+    MaxConnsPerID:     5,  // concurrent db session limit for each individual id (0 = no limit)
     Debug:             false,
 })
 ```
@@ -74,10 +74,12 @@ connection limits.
 
 - **UnlockTimeout** — the maximum time a request waits for access to an id's database.  `nil` means wait until the request context is done.  The timeout also auto-releases a session's lock when it expires (the escape hatch for a forgotten `cancel()`), but it does not stop a query that is already running — so **queries in a session must complete within the `UnlockTimeout`**.  For longer-running work, set `UnlockTimeout` to `nil` (the lock is then held until `cancel()` is called) or bound each query with a per-call context timeout below the `UnlockTimeout` (see [Timeouts](#timeouts)).
 - **StatementTimeout** — a server-side statement timeout backstop, applied where the database supports it (postgres and mysql).  Constructors return an error if you set it for a database that does not support it.
-- **MaxConnsPerID** — caps the number of concurrent database connections for each individual id (applied to the shared session and to separate sessions created by `RWGetDBWithTimeout`), so one busy or misbehaving id cannot exhaust the database server's connection limit.
-- **MaxConns** — caps the number of concurrent database sessions in total across all ids.  dblocker is a locker: a session is a single sequential unit of database work, exactly as if it were one transaction — an RW session acts like a single exclusive transaction for its id, and each read session is one concurrent reader.  Since all database access goes through dblocker and each session runs one command at a time, capping concurrent sessions caps concurrent database connections in use.  A session holds its slot from when access is granted (after any wait for the id's lock — sessions queued behind a busy id do not consume budget) until its `cancel()` is called.  Requests beyond the cap wait, subject to the request context and the `UnlockTimeout`.
+- **MaxConnsPerID** — caps the number of concurrent database sessions for each individual id, so one busy or misbehaving id cannot exhaust the database server's connection limit.  In practice the cap applies to concurrent read sessions, as RW sessions are already exclusive per id.
+- **MaxConns** — caps the number of concurrent database sessions in total across all ids.
 
-Within the caps, connections are reused rather than churned: a connection freed by one query goes directly to any waiting request, and is otherwise kept open for the id's next request; the whole pool is closed when the id's last request finishes, so an inactive id holds no connections.
+Both limits work the same way: dblocker gates the handing out of sessions with a semaphore — it never configures or touches the database pool itself (dblocker only opens the database, provides it, and closes it; to tune a pool, e.g. `SetMaxOpenConns`, do so in a custom `ConnectDBFunc`).  dblocker is a locker: a session is a single sequential unit of database work, exactly as if it were one transaction — an RW session acts like a single exclusive transaction for its id, and each read session is one concurrent reader.  Since all database access goes through dblocker and each session runs one command at a time, capping concurrent sessions caps concurrent database connections in use.  A session holds its slot from when access is granted (after any wait for the id's lock — sessions queued behind a busy id do not consume budget, and a session queued behind its id's `MaxConnsPerID` cap does not consume `MaxConns` budget) until its `cancel()` is called.  Requests beyond a cap wait, subject to the request context and the `UnlockTimeout`.
+
+An id's shared pool is closed when the id's last request finishes, so an inactive id holds no connections.
 
 ## Timeouts
 

@@ -58,8 +58,10 @@ func ExampleNew() {
 	// three concurrent readers finished
 }
 
-// ExampleNewWithOptions demonstrates capping the total number of database
-// connections each individual id may hold.
+// ExampleNewWithOptions demonstrates capping concurrent database sessions
+// for each individual id (MaxConnsPerID) and in total (MaxConns).  The caps
+// gate the handing out of sessions; the database pool itself is never
+// configured or touched by dblocker.
 func ExampleNewWithOptions() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -74,16 +76,23 @@ func ExampleNewWithOptions() {
 		panic(err)
 	}
 
-	cancelDB, db, err := store.RWGetDB(int64(7), ctx, "limited")
-	if err != nil {
-		panic(err)
+	// Take the three read sessions id 7 is allowed concurrently
+	for i := 0; i < 3; i++ {
+		cancelDB, _, err := store.ReadGetDB(int64(7), ctx, "reader")
+		if err != nil {
+			panic(err)
+		}
+		defer cancelDB()
 	}
-	defer cancelDB()
 
-	fmt.Println("max open connections for this id:", db.Stats().MaxOpenConnections)
+	// A fourth concurrent session for id 7 waits; here it times out
+	waitCtx, waitCancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer waitCancel()
+	_, _, err = store.ReadGetDB(int64(7), waitCtx, "over the cap")
+	fmt.Println("fourth concurrent session admitted:", err == nil)
 
 	// Output:
-	// max open connections for this id: 3
+	// fourth concurrent session admitted: false
 }
 
 // ExampleNewWithOptions_customConnectDBFunc demonstrates a custom

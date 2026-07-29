@@ -38,14 +38,16 @@ type Store struct {
 	UnlockTimeout    *time.Duration
 	StatementTimeout *time.Duration
 
-	// MaxConnsPerID caps the number of concurrent database connections in
-	// each id's pool (both the shared pool and any separate session opened
-	// with RWGetDBWithTimeout / RWGetDBxWithTimeout).  0 means no limit.
-	//
-	// Within the cap, connections are reused rather than churned: a freed
-	// connection is handed directly to any waiting request (database/sql
-	// semantics), and otherwise kept for the next request for the same id.
-	// The whole pool is closed when the id's last request finishes.
+	// MaxConnsPerID caps the number of concurrent database sessions for
+	// each individual id.  Like MaxConns, it is enforced by gating the
+	// handing out of sessions (a semaphore per id) — dblocker never
+	// configures or touches the database pool itself.  Since a session is
+	// a single sequential unit of database work (one command at a time),
+	// capping an id's concurrent sessions caps that id's concurrent
+	// database connections in use.  In practice the cap applies to
+	// concurrent read sessions, as RW sessions are already exclusive per
+	// id.  Requests beyond the cap wait, subject to the request context
+	// and the UnlockTimeout.  0 means no limit.
 	MaxConnsPerID int
 
 	// MaxConns caps the total number of concurrent database sessions
@@ -91,17 +93,19 @@ type Options struct {
 	// ConnectDBFunc).  nil disables it.
 	StatementTimeout *time.Duration
 
-	// MaxConnsPerID caps the number of concurrent database connections in
-	// each id's pool.  Within the cap, connections are reused: freed
-	// connections go directly to waiting requests, or are kept for the
-	// next request for the same id until the id's last request finishes
-	// (which closes the whole pool).  0 means no limit.
+	// MaxConnsPerID caps the number of concurrent database sessions for
+	// each individual id (see Store.MaxConnsPerID).  0 means no limit.
 	MaxConnsPerID int
 
 	// MaxConns caps the total number of concurrent database sessions
 	// across all ids, assuming all database access goes through dblocker
 	// (see Store.MaxConns).  0 means no limit.
 	MaxConns int
+
+	// Both limits gate the handing out of sessions.  dblocker never
+	// configures the database pools it opens — it only opens them, hands
+	// them out, and closes them.  To tune a pool (e.g. SetMaxOpenConns),
+	// do so in a custom ConnectDBFunc.
 
 	// Debug enables logging of lock acquisition and a ticker for
 	// long-held locks.
@@ -245,21 +249,6 @@ func (s *Store) connectDB(ctx context.Context, id interface{}, statementTimeout 
 	return s.connectDBFunc(ctx, id, s.DriverName, s.DataSourceName, statementTimeout)
 }
 
-// applyConnLimitsPerID applies the per-id connection limit (if any) to a
-// freshly connected database pool.  The idle limit is set to match the open
-// limit so that, within the cap, connections are reused for the id's next
-// requests rather than closed and re-dialled between bursts; the whole pool
-// is closed when the id's last request finishes.
-func (s *Store) applyConnLimitsPerID(db *sqlx.DB) {
-	if db == nil {
-		return
-	}
-	if s.MaxConnsPerID > 0 {
-		db.SetMaxOpenConns(s.MaxConnsPerID)
-		db.SetMaxIdleConns(s.MaxConnsPerID)
-	}
-}
-
 // RWGetDB returns a shared copy of a database session (*sql.DB) for the specified id.
 // RWGetDB acts like Lock() for a RWMutex for the specified id.
 // All other RWGetDB, RWGetDBWithTimeout, and ReadDB function calls will wait for access to the database for the specified id until the returned cancel() function is called.
@@ -374,6 +363,9 @@ func (s *Store) waitGetDB(id interface{}, accessType string, parentCtx context.C
 			readRequestCh: make(chan Request),
 			dbCh:          make(chan *sqlx.DB),
 		}
+		if s.MaxConnsPerID > 0 {
+			g.connSem = make(chan struct{}, s.MaxConnsPerID)
+		}
 		sh.m[id] = g
 		go s.startGroup(id, g)
 	}
@@ -426,13 +418,37 @@ func (s *Store) waitGetDB(id interface{}, accessType string, parentCtx context.C
 		return nil, nil, fmt.Errorf("unknown access type error: %s", accessType)
 	}
 
-	// Reserve a session slot if MaxConns is set.  The slot is acquired
-	// only after access for the id is granted (so sessions queued behind
-	// a busy id do not consume budget while they wait) and is released
+	// Reserve session slots if MaxConnsPerID and/or MaxConns are set.
+	// Both limits gate the handing out of sessions — the database pool
+	// itself is never configured or touched.  A slot is acquired only
+	// after access for the id is granted (so sessions queued behind a
+	// busy id do not consume budget while they wait) and is released
 	// when the session's context is done — i.e. when the caller calls
 	// cancel, or the UnlockTimeout expires.  Every return path below
 	// either calls cancel() or hands cancel to the caller, so the release
-	// goroutine always fires.
+	// goroutines always fire.
+	//
+	// The per-id slot is taken first so that a session waiting behind its
+	// id's cap does not consume store-wide MaxConns budget.
+	if g.connSem != nil {
+		select {
+		case g.connSem <- struct{}{}:
+			go func() {
+				<-ctx.Done()
+				<-g.connSem
+			}()
+		case <-s.Ctx.Done():
+			if cancel != nil {
+				cancel()
+			}
+			return nil, nil, s.Ctx.Err()
+		case <-ctx.Done():
+			if cancel != nil {
+				cancel()
+			}
+			return nil, nil, ctx.Err()
+		}
+	}
 	if s.connSem != nil {
 		select {
 		case s.connSem <- struct{}{}:
@@ -465,8 +481,6 @@ func (s *Store) waitGetDB(id interface{}, accessType string, parentCtx context.C
 			}
 			return nil, nil, err
 		}
-		s.applyConnLimitsPerID(db)
-
 		// Close the separate session when the request is done.  ctx is
 		// also cancelled when s.Ctx is done (see the goroutine above),
 		// so this covers store shutdown too.  Without this every

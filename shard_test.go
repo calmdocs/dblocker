@@ -156,21 +156,92 @@ func TestReadersConcurrentAcrossIDs(t *testing.T) {
 	}
 }
 
-// TestMaxConnsPerID checks that the per-id connection limit is applied to
-// the shared pool and to separate sessions.
+// TestMaxConnsPerID checks that concurrent sessions for one id are capped, a
+// session beyond the cap waits (and fails when its context ends), sessions
+// for other ids are unaffected, and a freed slot admits a waiting session.
 func TestMaxConnsPerID(t *testing.T) {
 	parentCtx, parentCancel := context.WithCancel(context.Background())
 	defer parentCancel()
 
 	unlockTimeout := 10 * time.Second
 	s, err := NewWithOptions(parentCtx, Options{
-		DriverName:     "mock",
-		DataSourceName: "",
-		UnlockTimeout:  &unlockTimeout,
-		MaxConnsPerID:  3,
+		DriverName:    "mock",
+		UnlockTimeout: &unlockTimeout,
+		MaxConnsPerID: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	// Fill both slots for id 1 with concurrent read sessions
+	cancel1, _, err := s.ReadGetDB(int64(1), parentCtx, "reader 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel1()
+	cancel2, _, err := s.ReadGetDB(int64(1), parentCtx, "reader 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A third session for id 1 must wait and fail once its context ends
+	waitCtx, waitCancel := context.WithTimeout(parentCtx, 500*time.Millisecond)
+	_, _, err = s.ReadGetDB(int64(1), waitCtx, "over the cap")
+	waitCancel()
+	if err == nil {
+		t.Fatal("third session for the id was admitted over MaxConnsPerID")
+	}
+
+	// Other ids are unaffected
+	cancelOther, _, err := s.ReadGetDB(int64(2), parentCtx, "other id")
+	if err != nil {
+		t.Fatalf("session for another id blocked by MaxConnsPerID: %v", err)
+	}
+	cancelOther()
+
+	// Releasing a slot admits a new session for id 1
+	cancel2()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		waitCtx, waitCancel := context.WithTimeout(parentCtx, 500*time.Millisecond)
+		cancel3, _, err := s.ReadGetDB(int64(1), waitCtx, "after release")
+		waitCancel()
+		if err == nil {
+			cancel3()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("session not admitted after slot release: %v", err)
+		}
+	}
+}
+
+// TestPoolsLeftUntouched checks that dblocker never configures the pools it
+// hands out — it only opens, provides, and closes them.  A pool it has not
+// touched reports MaxOpenConnections == 0 (unlimited, the database/sql
+// default), even when both connection limits are set.
+func TestPoolsLeftUntouched(t *testing.T) {
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	defer parentCancel()
+
+	unlockTimeout := 10 * time.Second
+	s, err := NewWithOptions(parentCtx, Options{
+		DriverName:    "mock",
+		UnlockTimeout: &unlockTimeout,
+		MaxConns:      100,
+		MaxConnsPerID: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.MaxConns != 100 {
+		t.Fatalf("MaxConns = %d, want 100", s.MaxConns)
+	}
+	if s.MaxConnsPerID != 3 {
+		t.Fatalf("MaxConnsPerID = %d, want 3", s.MaxConnsPerID)
+	}
+	if cap(s.connSem) != 100 {
+		t.Fatalf("connSem cap = %d, want 100", cap(s.connSem))
 	}
 
 	// Shared pool
@@ -178,8 +249,8 @@ func TestMaxConnsPerID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := db.Stats().MaxOpenConnections; got != 3 {
-		t.Fatalf("shared pool MaxOpenConnections = %d, want 3", got)
+	if got := db.Stats().MaxOpenConnections; got != 0 {
+		t.Fatalf("shared pool was configured: MaxOpenConnections = %d, want 0", got)
 	}
 	cancel()
 
@@ -188,48 +259,12 @@ func TestMaxConnsPerID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := db2.Stats().MaxOpenConnections; got != 3 {
-		t.Fatalf("separate session MaxOpenConnections = %d, want 3", got)
+	if got := db2.Stats().MaxOpenConnections; got != 0 {
+		t.Fatalf("separate session was configured: MaxOpenConnections = %d, want 0", got)
 	}
 	cancel2()
-}
 
-// TestConnLimitOptions checks that connection limits set via Options reach
-// the store and the per-id pools, without changing the behaviour of the
-// constructors that apply no limits.
-func TestConnLimitOptions(t *testing.T) {
-	parentCtx, parentCancel := context.WithCancel(context.Background())
-	defer parentCancel()
-
-	s, err := NewWithOptions(parentCtx, Options{
-		DriverName:    "mock",
-		MaxConns:      100,
-		MaxConnsPerID: 20,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s.MaxConns != 100 {
-		t.Fatalf("MaxConns = %d, want 100", s.MaxConns)
-	}
-	if s.MaxConnsPerID != 20 {
-		t.Fatalf("MaxConnsPerID = %d, want 20", s.MaxConnsPerID)
-	}
-	if cap(s.connSem) != 100 {
-		t.Fatalf("connSem cap = %d, want 100", cap(s.connSem))
-	}
-
-	// The per-id pool limit must reach the database pool
-	cancel, db, err := s.RWGetDB(int64(1), parentCtx, "defaults")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := db.Stats().MaxOpenConnections; got != 20 {
-		t.Fatalf("pool MaxOpenConnections = %d, want 20", got)
-	}
-	cancel()
-
-	// Existing constructors must remain unlimited
+	// Constructors without MaxConns apply no limit at all
 	s2, err := New(parentCtx, "mock", "", false)
 	if err != nil {
 		t.Fatal(err)
