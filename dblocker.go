@@ -88,6 +88,13 @@ type Options struct {
 
 	// UnlockTimeout is the maximum time a request waits for access to an
 	// id's database.  nil means wait until the request context is done.
+	//
+	// The timeout also auto-releases a session's lock when it expires
+	// (the escape hatch for a forgotten cancel), but it does not stop a
+	// query that is already running — so queries in a session must
+	// complete within the UnlockTimeout.  For longer-running work, set
+	// UnlockTimeout to nil or bound each query with a per-call context
+	// timeout below the UnlockTimeout.
 	UnlockTimeout *time.Duration
 
 	// StatementTimeout is the per-session statement timeout, applied where

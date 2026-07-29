@@ -116,6 +116,15 @@
 // the server enforces it on every connection the pool dials; note that
 // mysql's max_execution_time applies to SELECT statements only.
 //
+// One contract follows from the UnlockTimeout: a session's lock is
+// automatically released when the UnlockTimeout expires (the escape hatch
+// for a forgotten cancel), but a query already running is not stopped by
+// that release — so a query slower than the UnlockTimeout can overlap the
+// next session for the same id.  Queries in a session must therefore
+// complete within the UnlockTimeout; for longer-running work, set
+// UnlockTimeout to nil (the lock is then held until cancel is called) or
+// bound each query with a per-call context timeout below the UnlockTimeout.
+//
 // # Drivers
 //
 // sqlite (github.com/mattn/go-sqlite3), postgres (github.com/lib/pq), and
