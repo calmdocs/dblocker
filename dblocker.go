@@ -60,13 +60,15 @@ type Store struct {
 	MaxConnsPerID int
 
 	// MaxConns caps the total number of concurrent database sessions
-	// across all ids.  dblocker assumes all database access goes through
-	// it, and that each session runs one query at a time, so capping
-	// concurrent sessions caps concurrent database connections in use.
-	// A session holds its slot from when access is granted (after any
-	// wait for the id's lock) until its cancel function is called.
-	// Requests beyond the cap wait, subject to the request context and
-	// the UnlockTimeout.  0 means no limit.
+	// across all ids.  A session is a single sequential unit of database
+	// work, as if it were one transaction (an RW session acts like a
+	// single exclusive transaction for its id; a read session is one
+	// concurrent reader), so with all database access going through
+	// dblocker, capping concurrent sessions caps concurrent database
+	// connections in use.  A session holds its slot from when access is
+	// granted (after any wait for the id's lock) until its cancel
+	// function is called.  Requests beyond the cap wait, subject to the
+	// request context and the UnlockTimeout.  0 means no limit.
 	MaxConns int
 
 	debug bool

@@ -74,13 +74,19 @@
 //	})
 //
 // MaxConnsPerID caps each id's connection pool via database/sql's
-// SetMaxOpenConns.  MaxConns caps concurrent sessions store-wide: dblocker
-// assumes all database access goes through it, and that each session runs
-// one query at a time, so capping concurrent sessions caps concurrent
-// database connections in use.  A session holds its MaxConns slot from when
-// access is granted (after any wait for the id's lock) until its cancel
-// function is called.  A request beyond either cap waits, subject to the
-// request context and the UnlockTimeout.
+// SetMaxOpenConns.  MaxConns caps concurrent sessions store-wide.
+//
+// dblocker is a locker: a session is a single sequential unit of database
+// work, exactly as if it were one transaction.  An RW session acts like a
+// single exclusive transaction for its id, and each read session is one
+// concurrent reader.  Run a session's commands one after another; to do
+// work concurrently, take concurrent sessions.  Since all database access
+// goes through dblocker and each session runs one command at a time,
+// capping concurrent sessions (MaxConns) caps concurrent database
+// connections in use.  A session holds its MaxConns slot from when access
+// is granted (after any wait for the id's lock) until its cancel function
+// is called.  A request beyond either cap waits, subject to the request
+// context and the UnlockTimeout.
 //
 // Within the caps, connections are reused rather than churned: a connection
 // freed by one query is handed directly to any waiting request, and
