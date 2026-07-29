@@ -55,16 +55,10 @@
 //
 // # Connection limits
 //
-// NewWithConnLimits behaves exactly like New but additionally caps
-// concurrent database connections at DefaultMaxConns (100) in total across
-// all ids, and at DefaultMaxConnsPerID (20) for each individual id:
-//
-//	store, err := dblocker.NewWithConnLimits(ctx, "postgres", dsn, false)
-//
-// The existing constructors (New, NewWithUnlockAndStatementTimeouts, and
-// NewWithConnectDBFuncAndTimeouts) are unchanged and apply no limits.
-// Custom limits are available via NewWithConnLimitsAndTimeouts, or via
-// Options.MaxConns and Options.MaxConnsPerID:
+// Connection limits are set via Options.MaxConns (the total across all
+// ids) and Options.MaxConnsPerID (the cap for each individual id).  The
+// other constructors (New, NewWithUnlockAndStatementTimeouts, and
+// NewWithConnectDBFuncAndTimeouts) apply no limits:
 //
 //	store, err := dblocker.NewWithOptions(ctx, dblocker.Options{
 //		DriverName:     "postgres",

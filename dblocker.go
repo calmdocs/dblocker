@@ -16,17 +16,6 @@ import (
 // not nil, should be applied to the session where the database supports it.
 type ConnectDBFunc func(ctx context.Context, id interface{}, driverName, dataSourceName string, statementTimeout *time.Duration) (db *sqlx.DB, err error)
 
-// Default connection limits used by NewWithConnLimits.
-const (
-	// DefaultMaxConns is the default cap on concurrent database
-	// connections across all ids used by NewWithConnLimits.
-	DefaultMaxConns = 100
-
-	// DefaultMaxConnsPerID is the default cap on concurrent database
-	// connections for each individual id used by NewWithConnLimits.
-	DefaultMaxConnsPerID = 20
-)
-
 // Store is the dblocker store.
 //
 // The id -> *Group map is split across shardCount independently locked
@@ -197,73 +186,9 @@ func NewWithConnectDBFuncAndTimeouts(
 	})
 }
 
-// NewWithConnLimits creates a new dblocker Store exactly like New, and
-// additionally caps concurrent database connections at DefaultMaxConns (100)
-// in total across all ids, and at DefaultMaxConnsPerID (20) for each
-// individual id.
-//
-// Existing constructors (New, NewWithUnlockAndStatementTimeouts, and
-// NewWithConnectDBFuncAndTimeouts) are unchanged and apply no connection
-// limits.
-func NewWithConnLimits(
-	ctx context.Context,
-	driverName string,
-	dataSourceName string,
-	debug bool,
-) (s *Store, err error) {
-
-	// Default timeouts, as in New
-	unlockTimeout := 2 * time.Minute
-	defaultStatementTimeout := 4 * time.Minute
-
-	var statementTimeout *time.Duration
-	switch driverName {
-	case "postgres":
-		statementTimeout = &defaultStatementTimeout
-	case "mysql":
-		statementTimeout = &defaultStatementTimeout
-	default:
-	}
-
-	return NewWithConnLimitsAndTimeouts(
-		ctx,
-		driverName,
-		dataSourceName,
-		DefaultMaxConns,
-		DefaultMaxConnsPerID,
-		&unlockTimeout,
-		statementTimeout,
-		debug,
-	)
-}
-
-// NewWithConnLimitsAndTimeouts creates a new dblocker Store
-// with maxConns capping concurrent database connections in total across all ids (0 = no limit);
-// with maxConnsPerID capping concurrent database connections for each individual id (0 = no limit);
-// with an unlockTimeout for waiting for access to the database; and
-// with a statemenTimeout for database sessions (returns an error if not nil and the database does not support statement timeouts).
-func NewWithConnLimitsAndTimeouts(
-	ctx context.Context,
-	driverName string,
-	dataSourceName string,
-	maxConns int,
-	maxConnsPerID int,
-	unlockTimeout *time.Duration,
-	statementTimeout *time.Duration,
-	debug bool,
-) (s *Store, err error) {
-	return NewWithOptions(ctx, Options{
-		DriverName:       driverName,
-		DataSourceName:   dataSourceName,
-		UnlockTimeout:    unlockTimeout,
-		StatementTimeout: statementTimeout,
-		MaxConns:         maxConns,
-		MaxConnsPerID:    maxConnsPerID,
-		Debug:            debug,
-	})
-}
-
 // NewWithOptions creates a new dblocker Store from Options.
+// It is the constructor to use for connection limits: set Options.MaxConns
+// (total across all ids) and/or Options.MaxConnsPerID (per id).
 // It returns an error if Options.StatementTimeout is not nil and the database
 // does not support statement timeouts.
 func NewWithOptions(ctx context.Context, opts Options) (s *Store, err error) {

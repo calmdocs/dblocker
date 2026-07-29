@@ -194,19 +194,20 @@ func TestMaxConnsPerID(t *testing.T) {
 	cancel2()
 }
 
-// TestNewWithConnLimitsDefaults checks that NewWithConnLimits applies the
-// default limits (100 connections in total, 20 per id) without changing the
-// behaviour of the other constructors.
-func TestNewWithConnLimitsDefaults(t *testing.T) {
+// TestConnLimitOptions checks that connection limits set via Options reach
+// the store and the per-id pools, without changing the behaviour of the
+// constructors that apply no limits.
+func TestConnLimitOptions(t *testing.T) {
 	parentCtx, parentCancel := context.WithCancel(context.Background())
 	defer parentCancel()
 
-	s, err := NewWithConnLimits(parentCtx, "mock", "", false)
+	s, err := NewWithOptions(parentCtx, Options{
+		DriverName:    "mock",
+		MaxConns:      100,
+		MaxConnsPerID: 20,
+	})
 	if err != nil {
 		t.Fatal(err)
-	}
-	if DefaultMaxConns != 100 || DefaultMaxConnsPerID != 20 {
-		t.Fatalf("defaults changed: DefaultMaxConns=%d DefaultMaxConnsPerID=%d", DefaultMaxConns, DefaultMaxConnsPerID)
 	}
 	if s.MaxConns != 100 {
 		t.Fatalf("MaxConns = %d, want 100", s.MaxConns)
@@ -246,7 +247,11 @@ func TestMaxConns(t *testing.T) {
 	defer parentCancel()
 
 	unlockTimeout := 10 * time.Second
-	s, err := NewWithConnLimitsAndTimeouts(parentCtx, "mock", "", 2, 0, &unlockTimeout, nil, false)
+	s, err := NewWithOptions(parentCtx, Options{
+		DriverName:    "mock",
+		MaxConns:      2,
+		UnlockTimeout: &unlockTimeout,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

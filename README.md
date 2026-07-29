@@ -51,20 +51,11 @@ store is lock-sharded, barely even contend — see
 // No connection limits.
 dbStore, err := dblocker.New(ctx, driverName, dataSourceName, debug)
 
-// Like New, but additionally caps concurrent database connections at
-// 100 (DefaultMaxConns) in total across all ids, and at
-// 20 (DefaultMaxConnsPerID) for each individual id.
-dbStore, err := dblocker.NewWithConnLimits(ctx, driverName, dataSourceName, debug)
-
-// As above with custom limits and timeouts (0 disables a limit, nil disables a timeout).
-dbStore, err := dblocker.NewWithConnLimitsAndTimeouts(
-    ctx, driverName, dataSourceName, maxConns, maxConnsPerID, &unlockTimeout, &statementTimeout, debug)
-
 // Custom timeouts (nil disables the timeout).
 dbStore, err := dblocker.NewWithUnlockAndStatementTimeouts(
     ctx, driverName, dataSourceName, &unlockTimeout, &statementTimeout, debug)
 
-// Full control, including per-id connection limits and a custom connect function.
+// Full control, including connection limits and a custom connect function.
 dbStore, err := dblocker.NewWithOptions(ctx, dblocker.Options{
     ConnectDBFunc:     nil, // nil uses dblocker.DefaultConnectDBFunc
     DriverName:        "postgres",
