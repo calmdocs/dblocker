@@ -94,6 +94,28 @@
 // when the id's last request finishes, so an inactive id holds no
 // connections at all.
 //
+// # Timeouts
+//
+// There are three layers of query timeout, from finest to coarsest:
+//
+// Per call: to give an individual query a timeout (and leave other queries
+// without one), wrap that call's context — this works on every driver,
+// including sqlite:
+//
+//	qctx, qcancel := context.WithTimeout(ctx, 5*time.Second)
+//	defer qcancel()
+//	_, err = db.ExecContext(qctx, "UPDATE ...")   // this call: 5s limit
+//	_, err = db.ExecContext(ctx, "SELECT ...")    // this call: no limit
+//
+// Per session: RWGetDBWithTimeout / RWGetDBxWithTimeout open a separate
+// session whose statement timeout overrides the store's (nil disables it),
+// for one-off long-running work.
+//
+// Per store: StatementTimeout is a server-side backstop applied to every
+// session (postgres and mysql).  It is added to the data source name, so
+// the server enforces it on every connection the pool dials; note that
+// mysql's max_execution_time applies to SELECT statements only.
+//
 // # Drivers
 //
 // sqlite (github.com/mattn/go-sqlite3), postgres (github.com/lib/pq), and

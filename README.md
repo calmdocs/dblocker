@@ -82,11 +82,31 @@ Existing code using `New`, `NewWithUnlockAndStatementTimeouts`, or
 connection limits.
 
 - **UnlockTimeout** — the maximum time a request waits for access to an id's database.  `nil` means wait until the request context is done.
-- **StatementTimeout** — a per-session statement timeout, applied where the database supports it (postgres and mysql).  Constructors return an error if you set it for a database that does not support it.
+- **StatementTimeout** — a server-side statement timeout backstop, applied where the database supports it (postgres and mysql).  Constructors return an error if you set it for a database that does not support it.  It is added to the data source name, so the database server enforces it on every connection the pool dials (mysql's `max_execution_time` applies to SELECT statements only).
 - **MaxConnsPerID** — caps the number of concurrent database connections for each individual id (applied to the shared session and to separate sessions created by `RWGetDBWithTimeout`), so one busy or misbehaving id cannot exhaust the database server's connection limit.
 - **MaxConns** — caps the number of concurrent database sessions in total across all ids.  dblocker is a locker: a session is a single sequential unit of database work, exactly as if it were one transaction — an RW session acts like a single exclusive transaction for its id, and each read session is one concurrent reader.  Since all database access goes through dblocker and each session runs one command at a time, capping concurrent sessions caps concurrent database connections in use.  A session holds its slot from when access is granted (after any wait for the id's lock — sessions queued behind a busy id do not consume budget) until its `cancel()` is called.  Requests beyond the cap wait, subject to the request context and the `UnlockTimeout`.
 
 Within the caps, connections are reused rather than churned: a connection freed by one query goes directly to any waiting request, and is otherwise kept open for the id's next request; the whole pool is closed when the id's last request finishes, so an inactive id holds no connections.
+
+## Timeouts
+
+Three layers, from finest to coarsest:
+
+```go
+// Per call: wrap the individual query's context (works on every driver,
+// including sqlite).  Give some calls a timeout and others none:
+qctx, qcancel := context.WithTimeout(ctx, 5*time.Second)
+defer qcancel()
+_, err = db.ExecContext(qctx, "UPDATE ...")   // this call: 5 second limit
+_, err = db.ExecContext(ctx, "SELECT ...")    // this call: no limit
+
+// Per session: a separate session with its own statement timeout
+// (nil disables it) for one-off long-running work:
+cancelDB, db, err := dbStore.RWGetDBxWithTimeout(userID, ctx, "rebuild index", &longTimeout)
+
+// Per store: StatementTimeout (see Constructors above) is the server-side
+// backstop for every session.
+```
 
 ## Example
 
