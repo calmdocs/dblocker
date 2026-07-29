@@ -337,12 +337,6 @@ func (s *Store) applyConnLimitsPerID(db *sqlx.DB) {
 		db.SetMaxOpenConns(s.MaxConnsPerID)
 		db.SetMaxIdleConns(s.MaxConnsPerID)
 	}
-	if s.connLimiter != nil {
-		// When the store-wide MaxConns budget is shared, return idle
-		// connections to it after a minute so one id's warm pool cannot
-		// starve other ids indefinitely.
-		db.SetConnMaxIdleTime(time.Minute)
-	}
 }
 
 // RWGetDB returns a shared copy of a database session (*sql.DB) for the specified id.

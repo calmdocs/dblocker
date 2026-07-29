@@ -87,9 +87,7 @@
 // freed by one query is handed directly to any waiting request, and
 // otherwise kept open for the id's next request.  The whole pool is closed
 // when the id's last request finishes, so an inactive id holds no
-// connections at all.  When MaxConns is set, connections idle for more than
-// a minute are also closed, returning budget so one id's warm pool cannot
-// starve other ids.
+// connections at all.
 //
 // # Drivers
 //

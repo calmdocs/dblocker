@@ -86,7 +86,7 @@ connection limits.
 - **MaxConnsPerID** — caps the number of concurrent database connections for each individual id (applied to the shared session and to separate sessions created by `RWGetDBWithTimeout`), so one busy or misbehaving id cannot exhaust the database server's connection limit.
 - **MaxConns** — caps the number of concurrent database connections in total across all ids.  It is enforced at the driver level: every physical connection holds a slot in a store-wide budget from dial to close, so the total across every id's pool can never exceed it.  Opening a connection beyond the cap waits until one closes anywhere in the store, subject to the request context and the `UnlockTimeout`.  Because it instruments the driver, `MaxConns` requires the default connect function (`ConnectDBFunc` must be nil).
 
-Both limits count physical database connections.  Within the caps, connections are reused rather than churned: a connection freed by one query goes directly to any waiting request, and is otherwise kept open for the id's next request; the whole pool is closed when the id's last request finishes, so an inactive id holds no connections.  When `MaxConns` is set, connections idle for more than a minute are also closed, returning budget so one id's warm pool cannot starve other ids.
+Both limits count physical database connections.  Within the caps, connections are reused rather than churned: a connection freed by one query goes directly to any waiting request, and is otherwise kept open for the id's next request; the whole pool is closed when the id's last request finishes, so an inactive id holds no connections.
 
 ## Example
 
