@@ -1,6 +1,7 @@
 package dblocker
 
 import (
+	"context"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -42,11 +43,9 @@ func (s *Store) startGroup(id interface{}, g *Group) {
 	}
 	db, err := connectDBAndWait(
 		s.Ctx,
-		id,
-		s.connectDBFunc,
-		s.DriverName,
-		s.DataSourceName,
-		s.StatementTimeout,
+		func(ctx context.Context) (*sqlx.DB, error) {
+			return s.connectDB(ctx, id, s.StatementTimeout)
+		},
 		maxWait,
 	)
 	if err != nil {

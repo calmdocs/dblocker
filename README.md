@@ -15,7 +15,7 @@ Allows:
 - a simple mechanism to ensure that only one "user" or "id" writes to the database at any time, as if access for that "user" or "id" is locked behind a RWMutex.
 - database access such as multiple concurrent database select requests without also requiring the use of [pgbouncer](https://www.pgbouncer.org) for postgres or similar session access caching tools.
 - multiple sql commands (and other go code) to be run for a "user" or "id", while not worrying about concurrent access for that "user" or "id", and without needing to run all of the database commands in one database transaction.
-- a cap on the total number of database connections each individual "user" or "id" can hold (`MaxOpenConnsPerID`).
+- caps on the number of concurrent database connections for each individual "user" or "id" (`MaxConnsPerID`) and in total across all ids (`MaxConns`).
 
 If you use a custom [ConnectDBFunc](https://godoc.org/github.com/calmdocs/dblocker), you can also implement simple database sharding based on the "user" or "id" that you provide.
 
@@ -51,15 +51,14 @@ store is lock-sharded, barely even contend — see
 // No connection limits.
 dbStore, err := dblocker.New(ctx, driverName, dataSourceName, debug)
 
-// Like New, but additionally caps concurrent client sessions across all ids
-// at 100 (DefaultMaxClientConns) and each individual id's database
-// connection pool at 20 (DefaultPoolSize) — mirroring pgbouncer's
-// max_client_conn and default_pool_size.
+// Like New, but additionally caps concurrent database connections at
+// 100 (DefaultMaxConns) in total across all ids, and at
+// 20 (DefaultMaxConnsPerID) for each individual id.
 dbStore, err := dblocker.NewWithConnLimits(ctx, driverName, dataSourceName, debug)
 
 // As above with custom limits and timeouts (0 disables a limit, nil disables a timeout).
 dbStore, err := dblocker.NewWithConnLimitsAndTimeouts(
-    ctx, driverName, dataSourceName, maxClientConns, poolSize, &unlockTimeout, &statementTimeout, debug)
+    ctx, driverName, dataSourceName, maxConns, maxConnsPerID, &unlockTimeout, &statementTimeout, debug)
 
 // Custom timeouts (nil disables the timeout).
 dbStore, err := dblocker.NewWithUnlockAndStatementTimeouts(
@@ -72,8 +71,8 @@ dbStore, err := dblocker.NewWithOptions(ctx, dblocker.Options{
     DataSourceName:    dsn,
     UnlockTimeout:     &unlockTimeout,
     StatementTimeout:  &statementTimeout,
-    MaxClientConns:    50, // concurrent client session limit across all ids (0 = no limit)
-    MaxOpenConnsPerID: 5,  // total db connection limit for each individual id (0 = no limit)
+    MaxConns:          50, // total concurrent db connection limit across all ids (0 = no limit)
+    MaxConnsPerID:     5,  // concurrent db connection limit for each individual id (0 = no limit)
     Debug:             false,
 })
 ```
@@ -84,8 +83,10 @@ connection limits.
 
 - **UnlockTimeout** — the maximum time a request waits for access to an id's database.  `nil` means wait until the request context is done.
 - **StatementTimeout** — a per-session statement timeout, applied where the database supports it (postgres and mysql).  Constructors return an error if you set it for a database that does not support it.
-- **MaxClientConns** — caps concurrent client sessions across all ids, like pgbouncer's `max_client_conn`.  A session counts from acquisition until its `cancel()` is called (including time spent waiting for an id's lock); requests beyond the cap wait for a free slot, subject to their context and the `UnlockTimeout`.
-- **MaxOpenConnsPerID** — caps the size of each id's database connection pool, like pgbouncer's `default_pool_size` (applied to the shared session and to separate sessions created by `RWGetDBWithTimeout`).  This bounds the total number of database connections any single id can hold, so one busy or misbehaving id cannot exhaust the database server's connection limit.  Within the cap, connections are reused rather than churned: a connection freed by one query goes directly to any waiting request, and is otherwise kept open for the id's next request; the whole pool is closed when the id's last request finishes, so an inactive id holds no connections.
+- **MaxConnsPerID** — caps the number of concurrent database connections for each individual id (applied to the shared session and to separate sessions created by `RWGetDBWithTimeout`), so one busy or misbehaving id cannot exhaust the database server's connection limit.
+- **MaxConns** — caps the number of concurrent database connections in total across all ids.  It is enforced at the driver level: every physical connection holds a slot in a store-wide budget from dial to close, so the total across every id's pool can never exceed it.  Opening a connection beyond the cap waits until one closes anywhere in the store, subject to the request context and the `UnlockTimeout`.  Because it instruments the driver, `MaxConns` requires the default connect function (`ConnectDBFunc` must be nil).
+
+Both limits count physical database connections.  Within the caps, connections are reused rather than churned: a connection freed by one query goes directly to any waiting request, and is otherwise kept open for the id's next request; the whole pool is closed when the id's last request finishes, so an inactive id holds no connections.  When `MaxConns` is set, connections idle for more than a minute are also closed, returning budget so one id's warm pool cannot starve other ids.
 
 ## Example
 

@@ -15,48 +15,80 @@ func DefaultConnectDBFunc(ctx context.Context, id interface{}, driverName, dataS
 	switch driverName {
 	case "mock":
 		mockDB, _, err := sqlmock.New()
-		if err == nil && statementTimeout != nil {
-			return nil, fmt.Errorf("connectDB error: statementTimeout for database type not implemented: %s", driverName)
+		if err != nil {
+			return nil, err
 		}
 		db = sqlx.NewDb(mockDB, "sqlmock")
-	case "sqlite3":
+	case "sqlite3", "postgres", "mysql":
 		db, err = sqlx.ConnectContext(ctx, driverName, dataSourceName)
-		if err == nil && statementTimeout != nil {
-			return nil, fmt.Errorf("connectDB error: statementTimeout for database type not implemented: %s", driverName)
-		}
-	case "postgres":
-		db, err = sqlx.ConnectContext(ctx, driverName, dataSourceName)
-		if err == nil && statementTimeout != nil {
-			_, err := db.ExecContext(ctx, fmt.Sprintf("SET statement_timeout = %d;", statementTimeout.Milliseconds()))
-			if err != nil {
-				return nil, err
-			}
-		}
-	case "mysql":
-		db, err = sqlx.ConnectContext(ctx, driverName, dataSourceName)
-		if err == nil && statementTimeout != nil {
-			_, err := db.ExecContext(ctx, fmt.Sprintf("SET SESSION MAX_EXECUTION_TIME=%d;", statementTimeout.Milliseconds()))
-			if err != nil {
-				return nil, err
-			}
+		if err != nil {
+			return nil, err
 		}
 	default:
 		return nil, fmt.Errorf("connectDB error: database type not implemented: %s", driverName)
 	}
-	return db, err
+	if err := setStatementTimeout(ctx, db, driverName, statementTimeout); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
 }
 
-// connectDBAndWait retries connectDBFunc every 2 seconds until it succeeds,
+// limitedConnectDB connects like DefaultConnectDBFunc, but every physical
+// database connection in the returned pool counts against limiter (the
+// store-wide MaxConns budget).  The "mock" driver's pool is created by
+// sqlmock itself and cannot be wrapped, so mock connections are not counted.
+func limitedConnectDB(ctx context.Context, driverName, dataSourceName string, statementTimeout *time.Duration, limiter *connLimiter) (db *sqlx.DB, err error) {
+	switch driverName {
+	case "mock":
+		return DefaultConnectDBFunc(ctx, nil, driverName, dataSourceName, statementTimeout)
+	case "sqlite3", "postgres", "mysql":
+		sqlDB, err := openLimitedDB(driverName, dataSourceName, limiter)
+		if err != nil {
+			return nil, err
+		}
+		db = sqlx.NewDb(sqlDB, driverName)
+		if err := db.PingContext(ctx); err != nil {
+			db.Close()
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("connectDB error: database type not implemented: %s", driverName)
+	}
+	if err := setStatementTimeout(ctx, db, driverName, statementTimeout); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// setStatementTimeout applies statementTimeout to the database session for
+// databases that support it.  A nil statementTimeout is a no-op; a non-nil
+// statementTimeout for a database without statement timeout support is an
+// error.
+func setStatementTimeout(ctx context.Context, db *sqlx.DB, driverName string, statementTimeout *time.Duration) error {
+	if statementTimeout == nil {
+		return nil
+	}
+	switch driverName {
+	case "postgres":
+		_, err := db.ExecContext(ctx, fmt.Sprintf("SET statement_timeout = %d;", statementTimeout.Milliseconds()))
+		return err
+	case "mysql":
+		_, err := db.ExecContext(ctx, fmt.Sprintf("SET SESSION MAX_EXECUTION_TIME=%d;", statementTimeout.Milliseconds()))
+		return err
+	default:
+		return fmt.Errorf("connectDB error: statementTimeout for database type not implemented: %s", driverName)
+	}
+}
+
+// connectDBAndWait retries connect every 2 seconds until it succeeds,
 // maxWait elapses, or ctx is cancelled.  On failure the last connect error is
 // returned so callers can surface the real cause (e.g. "unable to open
 // database file") instead of retrying forever and never reporting anything.
 func connectDBAndWait(
 	ctx context.Context,
-	id interface{},
-	connectDBFunc func(ctx context.Context, id interface{}, driverName, dataSourceName string, statementTimeout *time.Duration) (db *sqlx.DB, err error),
-	driverName string,
-	dataSourceName string,
-	statementTimeout *time.Duration,
+	connect func(ctx context.Context) (db *sqlx.DB, err error),
 	maxWait time.Duration,
 ) (db *sqlx.DB, err error) {
 
@@ -66,7 +98,7 @@ func connectDBAndWait(
 
 	deadline := time.Now().Add(maxWait)
 	for {
-		db, err = connectDBFunc(ctx, id, driverName, dataSourceName, statementTimeout)
+		db, err = connect(ctx)
 		if err == nil {
 			return db, nil
 		}

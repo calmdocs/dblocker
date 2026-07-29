@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jmoiron/sqlx"
 )
 
 // TestShardIndexStable checks that the same id always maps to the same shard
@@ -153,18 +155,18 @@ func TestReadersConcurrentAcrossIDs(t *testing.T) {
 	}
 }
 
-// TestMaxOpenConnsPerID checks that the per-id connection limit is applied to
+// TestMaxConnsPerID checks that the per-id connection limit is applied to
 // the shared pool and to separate sessions.
-func TestMaxOpenConnsPerID(t *testing.T) {
+func TestMaxConnsPerID(t *testing.T) {
 	parentCtx, parentCancel := context.WithCancel(context.Background())
 	defer parentCancel()
 
 	unlockTimeout := 10 * time.Second
 	s, err := NewWithOptions(parentCtx, Options{
-		DriverName:        "mock",
-		DataSourceName:    "",
-		UnlockTimeout:     &unlockTimeout,
-		MaxOpenConnsPerID: 3,
+		DriverName:     "mock",
+		DataSourceName: "",
+		UnlockTimeout:  &unlockTimeout,
+		MaxConnsPerID:  3,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -192,7 +194,7 @@ func TestMaxOpenConnsPerID(t *testing.T) {
 }
 
 // TestNewWithConnLimitsDefaults checks that NewWithConnLimits applies the
-// default limits (100 client conns, per-id pool size 20) without changing the
+// default limits (100 connections in total, 20 per id) without changing the
 // behaviour of the other constructors.
 func TestNewWithConnLimitsDefaults(t *testing.T) {
 	parentCtx, parentCancel := context.WithCancel(context.Background())
@@ -202,17 +204,17 @@ func TestNewWithConnLimitsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if DefaultMaxClientConns != 100 || DefaultPoolSize != 20 {
-		t.Fatalf("defaults changed: DefaultMaxClientConns=%d DefaultPoolSize=%d", DefaultMaxClientConns, DefaultPoolSize)
+	if DefaultMaxConns != 100 || DefaultMaxConnsPerID != 20 {
+		t.Fatalf("defaults changed: DefaultMaxConns=%d DefaultMaxConnsPerID=%d", DefaultMaxConns, DefaultMaxConnsPerID)
 	}
-	if s.MaxClientConns != 100 {
-		t.Fatalf("MaxClientConns = %d, want 100", s.MaxClientConns)
+	if s.MaxConns != 100 {
+		t.Fatalf("MaxConns = %d, want 100", s.MaxConns)
 	}
-	if s.MaxOpenConnsPerID != 20 {
-		t.Fatalf("MaxOpenConnsPerID = %d, want 20", s.MaxOpenConnsPerID)
+	if s.MaxConnsPerID != 20 {
+		t.Fatalf("MaxConnsPerID = %d, want 20", s.MaxConnsPerID)
 	}
-	if cap(s.clientConnCh) != 100 {
-		t.Fatalf("clientConnCh cap = %d, want 100", cap(s.clientConnCh))
+	if s.connLimiter == nil || cap(s.connLimiter.sem) != 100 {
+		t.Fatal("connLimiter not sized to MaxConns")
 	}
 
 	// The per-id pool limit must reach the database pool
@@ -230,58 +232,8 @@ func TestNewWithConnLimitsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s2.MaxClientConns != 0 || s2.MaxOpenConnsPerID != 0 || s2.clientConnCh != nil {
-		t.Fatalf("New applied connection limits: MaxClientConns=%d MaxOpenConnsPerID=%d", s2.MaxClientConns, s2.MaxOpenConnsPerID)
-	}
-}
-
-// TestMaxClientConns checks that concurrent client sessions across all ids
-// are capped, that a request beyond the cap waits, and that it proceeds once
-// a slot is released.
-func TestMaxClientConns(t *testing.T) {
-	parentCtx, parentCancel := context.WithCancel(context.Background())
-	defer parentCancel()
-
-	unlockTimeout := 10 * time.Second
-	s, err := NewWithConnLimitsAndTimeouts(parentCtx, "mock", "", 2, 0, &unlockTimeout, nil, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Fill both slots with read sessions on different ids
-	cancel1, _, err := s.ReadGetDB(int64(1), parentCtx, "slot 1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	cancel2, _, err := s.ReadGetDB(int64(2), parentCtx, "slot 2")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cancel2()
-
-	// A third session must wait for a slot and fail once its context ends
-	waitCtx, waitCancel := context.WithTimeout(parentCtx, 500*time.Millisecond)
-	_, _, err = s.ReadGetDB(int64(3), waitCtx, "over the cap")
-	waitCancel()
-	if err == nil {
-		t.Fatal("third session was admitted over MaxClientConns")
-	}
-
-	// Releasing a slot must admit a new session
-	cancel1()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		ctx, ctxCancel := context.WithTimeout(parentCtx, 500*time.Millisecond)
-		cancel3, db, err := s.ReadGetDB(int64(3), ctx, "after release")
-		ctxCancel()
-		if err == nil && db != nil {
-			cancel3()
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("session not admitted after slot release: %v", err)
-		}
-		time.Sleep(50 * time.Millisecond)
+	if s2.MaxConns != 0 || s2.MaxConnsPerID != 0 || s2.connLimiter != nil {
+		t.Fatalf("New applied connection limits: MaxConns=%d MaxConnsPerID=%d", s2.MaxConns, s2.MaxConnsPerID)
 	}
 }
 
@@ -290,11 +242,17 @@ func TestNewWithOptionsValidation(t *testing.T) {
 	parentCtx, parentCancel := context.WithCancel(context.Background())
 	defer parentCancel()
 
-	if _, err := NewWithOptions(parentCtx, Options{DriverName: "mock", MaxOpenConnsPerID: -1}); err == nil {
-		t.Fatal("expected error for negative MaxOpenConnsPerID")
+	if _, err := NewWithOptions(parentCtx, Options{DriverName: "mock", MaxConnsPerID: -1}); err == nil {
+		t.Fatal("expected error for negative MaxConnsPerID")
 	}
-	if _, err := NewWithOptions(parentCtx, Options{DriverName: "mock", MaxClientConns: -1}); err == nil {
-		t.Fatal("expected error for negative MaxClientConns")
+	if _, err := NewWithOptions(parentCtx, Options{DriverName: "mock", MaxConns: -1}); err == nil {
+		t.Fatal("expected error for negative MaxConns")
+	}
+	customConnect := func(ctx context.Context, id interface{}, driverName, dataSourceName string, statementTimeout *time.Duration) (*sqlx.DB, error) {
+		return DefaultConnectDBFunc(ctx, id, driverName, dataSourceName, statementTimeout)
+	}
+	if _, err := NewWithOptions(parentCtx, Options{DriverName: "mock", ConnectDBFunc: customConnect, MaxConns: 1}); err == nil {
+		t.Fatal("expected error for MaxConns with a custom ConnectDBFunc")
 	}
 	statementTimeout := time.Minute
 	if _, err := NewWithOptions(parentCtx, Options{DriverName: "sqlite3", StatementTimeout: &statementTimeout}); err == nil {

@@ -16,16 +16,15 @@ import (
 // not nil, should be applied to the session where the database supports it.
 type ConnectDBFunc func(ctx context.Context, id interface{}, driverName, dataSourceName string, statementTimeout *time.Duration) (db *sqlx.DB, err error)
 
-// Default connection limits used by NewWithConnLimits (mirroring pgbouncer's
-// max_client_conn and default_pool_size defaults).
+// Default connection limits used by NewWithConnLimits.
 const (
-	// DefaultMaxClientConns is the default cap on concurrent client
-	// sessions across all ids used by NewWithConnLimits.
-	DefaultMaxClientConns = 100
+	// DefaultMaxConns is the default cap on concurrent database
+	// connections across all ids used by NewWithConnLimits.
+	DefaultMaxConns = 100
 
-	// DefaultPoolSize is the default cap on each individual id's database
-	// connection pool used by NewWithConnLimits.
-	DefaultPoolSize = 20
+	// DefaultMaxConnsPerID is the default cap on concurrent database
+	// connections for each individual id used by NewWithConnLimits.
+	DefaultMaxConnsPerID = 20
 )
 
 // Store is the dblocker store.
@@ -39,32 +38,35 @@ type Store struct {
 	shards        [shardCount]shard
 	connectDBFunc ConnectDBFunc
 
-	// clientConnCh is a semaphore bounding concurrent client sessions
-	// across all ids when MaxClientConns > 0 (nil means no limit).  A slot
-	// is reserved for the lifetime of each session: from waitGetDB until
-	// the session's context is done (cancel called, or timeout).
-	clientConnCh chan struct{}
+	// connLimiter bounds the total number of open database connections
+	// across all ids when MaxConns > 0 (nil means no limit).  Every
+	// physical connection holds a slot from dial to close (see
+	// connlimit.go).
+	connLimiter *connLimiter
 
 	DriverName       string
 	DataSourceName   string
 	UnlockTimeout    *time.Duration
 	StatementTimeout *time.Duration
 
-	// MaxOpenConnsPerID caps the number of open connections in each id's
-	// database pool (both the shared pool and any separate session opened
+	// MaxConnsPerID caps the number of concurrent database connections in
+	// each id's pool (both the shared pool and any separate session opened
 	// with RWGetDBWithTimeout / RWGetDBxWithTimeout).  0 means no limit.
 	//
 	// Within the cap, connections are reused rather than churned: a freed
 	// connection is handed directly to any waiting request (database/sql
 	// semantics), and otherwise kept for the next request for the same id.
 	// The whole pool is closed when the id's last request finishes.
-	MaxOpenConnsPerID int
+	MaxConnsPerID int
 
-	// MaxClientConns caps the number of concurrent client sessions across
-	// all ids (like pgbouncer's max_client_conn).  Requests beyond the cap
-	// wait for a slot, subject to their context and the UnlockTimeout.
-	// 0 means no limit.
-	MaxClientConns int
+	// MaxConns caps the total number of concurrent database connections
+	// across all ids.  Opening a connection beyond the cap waits until a
+	// connection closes anywhere in the store, subject to the request
+	// context and the UnlockTimeout.  0 means no limit.
+	//
+	// MaxConns counts physical driver connections, so it requires the
+	// default connect function (Options.ConnectDBFunc must be nil).
+	MaxConns int
 
 	debug bool
 }
@@ -90,16 +92,18 @@ type Options struct {
 	// ConnectDBFunc).  nil disables it.
 	StatementTimeout *time.Duration
 
-	// MaxOpenConnsPerID caps the number of open connections in each id's
-	// database pool.  Within the cap, connections are reused: freed
+	// MaxConnsPerID caps the number of concurrent database connections in
+	// each id's pool.  Within the cap, connections are reused: freed
 	// connections go directly to waiting requests, or are kept for the
 	// next request for the same id until the id's last request finishes
 	// (which closes the whole pool).  0 means no limit.
-	MaxOpenConnsPerID int
+	MaxConnsPerID int
 
-	// MaxClientConns caps the number of concurrent client sessions across
-	// all ids (like pgbouncer's max_client_conn).  0 means no limit.
-	MaxClientConns int
+	// MaxConns caps the total number of concurrent database connections
+	// across all ids.  It counts physical driver connections, so it
+	// requires the default connect function (ConnectDBFunc must be nil).
+	// 0 means no limit.
+	MaxConns int
 
 	// Debug enables logging of lock acquisition and a ticker for
 	// long-held locks.
@@ -185,9 +189,9 @@ func NewWithConnectDBFuncAndTimeouts(
 }
 
 // NewWithConnLimits creates a new dblocker Store exactly like New, and
-// additionally caps concurrent client sessions across all ids at
-// DefaultMaxClientConns (100) and each individual id's database connection
-// pool at DefaultPoolSize (20) connections.
+// additionally caps concurrent database connections at DefaultMaxConns (100)
+// in total across all ids, and at DefaultMaxConnsPerID (20) for each
+// individual id.
 //
 // Existing constructors (New, NewWithUnlockAndStatementTimeouts, and
 // NewWithConnectDBFuncAndTimeouts) are unchanged and apply no connection
@@ -216,8 +220,8 @@ func NewWithConnLimits(
 		ctx,
 		driverName,
 		dataSourceName,
-		DefaultMaxClientConns,
-		DefaultPoolSize,
+		DefaultMaxConns,
+		DefaultMaxConnsPerID,
 		&unlockTimeout,
 		statementTimeout,
 		debug,
@@ -225,28 +229,28 @@ func NewWithConnLimits(
 }
 
 // NewWithConnLimitsAndTimeouts creates a new dblocker Store
-// with maxClientConns capping concurrent client sessions across all ids (0 = no limit);
-// with poolSize capping each individual id's database connection pool (0 = no limit);
+// with maxConns capping concurrent database connections in total across all ids (0 = no limit);
+// with maxConnsPerID capping concurrent database connections for each individual id (0 = no limit);
 // with an unlockTimeout for waiting for access to the database; and
 // with a statemenTimeout for database sessions (returns an error if not nil and the database does not support statement timeouts).
 func NewWithConnLimitsAndTimeouts(
 	ctx context.Context,
 	driverName string,
 	dataSourceName string,
-	maxClientConns int,
-	poolSize int,
+	maxConns int,
+	maxConnsPerID int,
 	unlockTimeout *time.Duration,
 	statementTimeout *time.Duration,
 	debug bool,
 ) (s *Store, err error) {
 	return NewWithOptions(ctx, Options{
-		DriverName:        driverName,
-		DataSourceName:    dataSourceName,
-		UnlockTimeout:     unlockTimeout,
-		StatementTimeout:  statementTimeout,
-		MaxClientConns:    maxClientConns,
-		MaxOpenConnsPerID: poolSize,
-		Debug:             debug,
+		DriverName:       driverName,
+		DataSourceName:   dataSourceName,
+		UnlockTimeout:    unlockTimeout,
+		StatementTimeout: statementTimeout,
+		MaxConns:         maxConns,
+		MaxConnsPerID:    maxConnsPerID,
+		Debug:            debug,
 	})
 }
 
@@ -275,31 +279,49 @@ func NewWithOptions(ctx context.Context, opts Options) (s *Store, err error) {
 		}
 	}
 
-	if opts.MaxOpenConnsPerID < 0 {
-		return nil, fmt.Errorf("dblocker error: MaxOpenConnsPerID must not be negative: %d", opts.MaxOpenConnsPerID)
+	if opts.MaxConnsPerID < 0 {
+		return nil, fmt.Errorf("dblocker error: MaxConnsPerID must not be negative: %d", opts.MaxConnsPerID)
 	}
-	if opts.MaxClientConns < 0 {
-		return nil, fmt.Errorf("dblocker error: MaxClientConns must not be negative: %d", opts.MaxClientConns)
+	if opts.MaxConns < 0 {
+		return nil, fmt.Errorf("dblocker error: MaxConns must not be negative: %d", opts.MaxConns)
+	}
+
+	// MaxConns counts physical driver connections, which requires opening
+	// the database pools ourselves — a custom ConnectDBFunc builds its own
+	// pools, which cannot be instrumented.
+	if opts.MaxConns > 0 && opts.ConnectDBFunc != nil {
+		return nil, fmt.Errorf("dblocker error: MaxConns requires the default connect function (ConnectDBFunc must be nil)")
 	}
 
 	s = &Store{
-		Ctx:               ctx,
-		connectDBFunc:     connectDBFunc,
-		DriverName:        opts.DriverName,
-		DataSourceName:    opts.DataSourceName,
-		UnlockTimeout:     opts.UnlockTimeout,
-		StatementTimeout:  opts.StatementTimeout,
-		MaxOpenConnsPerID: opts.MaxOpenConnsPerID,
-		MaxClientConns:    opts.MaxClientConns,
-		debug:             opts.Debug,
+		Ctx:              ctx,
+		connectDBFunc:    connectDBFunc,
+		DriverName:       opts.DriverName,
+		DataSourceName:   opts.DataSourceName,
+		UnlockTimeout:    opts.UnlockTimeout,
+		StatementTimeout: opts.StatementTimeout,
+		MaxConnsPerID:    opts.MaxConnsPerID,
+		MaxConns:         opts.MaxConns,
+		debug:            opts.Debug,
 	}
-	if opts.MaxClientConns > 0 {
-		s.clientConnCh = make(chan struct{}, opts.MaxClientConns)
+	if opts.MaxConns > 0 {
+		s.connLimiter = newConnLimiter(opts.MaxConns)
 	}
 	for i := range s.shards {
 		s.shards[i].m = make(map[interface{}]*Group)
 	}
 	return s, nil
+}
+
+// connectDB dials the database for id.  When MaxConns is set, connections
+// are opened through the store's connLimiter so that every physical
+// connection counts against the store-wide budget; otherwise the configured
+// connectDBFunc is used directly.
+func (s *Store) connectDB(ctx context.Context, id interface{}, statementTimeout *time.Duration) (*sqlx.DB, error) {
+	if s.connLimiter != nil {
+		return limitedConnectDB(ctx, s.DriverName, s.DataSourceName, statementTimeout, s.connLimiter)
+	}
+	return s.connectDBFunc(ctx, id, s.DriverName, s.DataSourceName, statementTimeout)
 }
 
 // applyConnLimitsPerID applies the per-id connection limit (if any) to a
@@ -311,9 +333,15 @@ func (s *Store) applyConnLimitsPerID(db *sqlx.DB) {
 	if db == nil {
 		return
 	}
-	if s.MaxOpenConnsPerID > 0 {
-		db.SetMaxOpenConns(s.MaxOpenConnsPerID)
-		db.SetMaxIdleConns(s.MaxOpenConnsPerID)
+	if s.MaxConnsPerID > 0 {
+		db.SetMaxOpenConns(s.MaxConnsPerID)
+		db.SetMaxIdleConns(s.MaxConnsPerID)
+	}
+	if s.connLimiter != nil {
+		// When the store-wide MaxConns budget is shared, return idle
+		// connections to it after a minute so one id's warm pool cannot
+		// starve other ids indefinitely.
+		db.SetConnMaxIdleTime(time.Minute)
 	}
 }
 
@@ -401,25 +429,7 @@ func (s *Store) waitGetDB(id interface{}, accessType string, parentCtx context.C
 		return nil, nil, fmt.Errorf("unknown access type error: %s", accessType)
 	}
 
-	// Reserve a client connection slot if MaxClientConns is set.  The slot
-	// is held for the lifetime of the session and released by the watcher
-	// goroutine below when the session context is done (i.e. when the
-	// caller cancels, or the UnlockTimeout expires).  Every return path
-	// after this point either calls cancel() or hands cancel to the
-	// caller, so the watcher always runs and the slot is always released.
-	if s.clientConnCh != nil {
-		select {
-		case s.clientConnCh <- struct{}{}:
-		case <-s.Ctx.Done():
-			ctxCancel()
-			return nil, nil, s.Ctx.Err()
-		case <-ctx.Done():
-			ctxCancel()
-			return nil, nil, ctx.Err()
-		}
-	}
-
-	// Cancel context when done, then release the client connection slot
+	// Cancel context when done
 	go func() {
 		if s.debug {
 			fmt.Println(fmt.Sprintf("dblocker: %s", accessType), tag)
@@ -432,10 +442,6 @@ func (s *Store) waitGetDB(id interface{}, accessType string, parentCtx context.C
 			ctxCancel()
 		case <-ctx.Done():
 			ctxCancel()
-		}
-
-		if s.clientConnCh != nil {
-			<-s.clientConnCh
 		}
 	}()
 
@@ -508,7 +514,7 @@ func (s *Store) waitGetDB(id interface{}, accessType string, parentCtx context.C
 	case "rwseparate":
 
 		// Get new database connection (immediately)
-		db, err = s.connectDBFunc(ctx, id, s.DriverName, s.DataSourceName, statementTimeout)
+		db, err = s.connectDB(ctx, id, statementTimeout)
 		if err != nil {
 			if cancel != nil {
 				cancel()

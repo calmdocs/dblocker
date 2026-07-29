@@ -65,9 +65,10 @@ func ExampleNewWithOptions() {
 	defer cancel()
 
 	store, err := dblocker.NewWithOptions(ctx, dblocker.Options{
-		DriverName:        "mock",
-		DataSourceName:    "",
-		MaxOpenConnsPerID: 3,
+		DriverName:     "mock",
+		DataSourceName: "",
+		MaxConns:       50,
+		MaxConnsPerID:  3,
 	})
 	if err != nil {
 		panic(err)

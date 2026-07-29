@@ -56,34 +56,40 @@
 // # Connection limits
 //
 // NewWithConnLimits behaves exactly like New but additionally caps
-// concurrent client sessions across all ids at DefaultMaxClientConns (100)
-// and each individual id's database connection pool at DefaultPoolSize (20)
-// — mirroring pgbouncer's max_client_conn and default_pool_size:
+// concurrent database connections at DefaultMaxConns (100) in total across
+// all ids, and at DefaultMaxConnsPerID (20) for each individual id:
 //
 //	store, err := dblocker.NewWithConnLimits(ctx, "postgres", dsn, false)
 //
 // The existing constructors (New, NewWithUnlockAndStatementTimeouts, and
 // NewWithConnectDBFuncAndTimeouts) are unchanged and apply no limits.
 // Custom limits are available via NewWithConnLimitsAndTimeouts, or via
-// Options.MaxClientConns and Options.MaxOpenConnsPerID:
+// Options.MaxConns and Options.MaxConnsPerID:
 //
 //	store, err := dblocker.NewWithOptions(ctx, dblocker.Options{
-//		DriverName:        "postgres",
-//		DataSourceName:    dsn,
-//		MaxClientConns:    50,
-//		MaxOpenConnsPerID: 5,
+//		DriverName:     "postgres",
+//		DataSourceName: dsn,
+//		MaxConns:       50,
+//		MaxConnsPerID:  5,
 //	})
 //
-// MaxClientConns counts sessions from acquisition until their cancel
-// function is called (or their context ends), including sessions still
-// waiting for an id's lock.  Requests beyond the cap wait for a free slot,
-// subject to their context and the UnlockTimeout.
+// Both limits count physical database connections.  MaxConnsPerID caps each
+// id's pool via database/sql's SetMaxOpenConns.  MaxConns is enforced at the
+// driver level: every connection holds a slot in a store-wide budget from
+// dial to close, so the total across every id's pool (and every separate
+// session) can never exceed it.  Opening a connection beyond a cap waits
+// until one closes, subject to the request context and the UnlockTimeout.
+// Because MaxConns instruments the driver, it requires the default connect
+// function (Options.ConnectDBFunc must be nil), and connections made by the
+// "mock" test driver are not counted.
 //
-// Within an id's pool cap, connections are reused rather than churned: a
-// connection freed by one query is handed directly to any waiting request,
-// and otherwise kept open for the id's next request.  The whole pool is
-// closed when the id's last request finishes, so an inactive id holds no
-// connections at all.
+// Within the caps, connections are reused rather than churned: a connection
+// freed by one query is handed directly to any waiting request, and
+// otherwise kept open for the id's next request.  The whole pool is closed
+// when the id's last request finishes, so an inactive id holds no
+// connections at all.  When MaxConns is set, connections idle for more than
+// a minute are also closed, returning budget so one id's warm pool cannot
+// starve other ids.
 //
 // # Drivers
 //
