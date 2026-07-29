@@ -213,8 +213,8 @@ func TestNewWithConnLimitsDefaults(t *testing.T) {
 	if s.MaxConnsPerID != 20 {
 		t.Fatalf("MaxConnsPerID = %d, want 20", s.MaxConnsPerID)
 	}
-	if s.connLimiter == nil || cap(s.connLimiter.sem) != 100 {
-		t.Fatal("connLimiter not sized to MaxConns")
+	if cap(s.connSem) != 100 {
+		t.Fatalf("connSem cap = %d, want 100", cap(s.connSem))
 	}
 
 	// The per-id pool limit must reach the database pool
@@ -232,8 +232,58 @@ func TestNewWithConnLimitsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s2.MaxConns != 0 || s2.MaxConnsPerID != 0 || s2.connLimiter != nil {
+	if s2.MaxConns != 0 || s2.MaxConnsPerID != 0 || s2.connSem != nil {
 		t.Fatalf("New applied connection limits: MaxConns=%d MaxConnsPerID=%d", s2.MaxConns, s2.MaxConnsPerID)
+	}
+}
+
+// TestMaxConns checks that concurrent database sessions across all ids are
+// capped, that a session beyond the cap waits, and that it proceeds once a
+// slot is released.
+func TestMaxConns(t *testing.T) {
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	defer parentCancel()
+
+	unlockTimeout := 10 * time.Second
+	s, err := NewWithConnLimitsAndTimeouts(parentCtx, "mock", "", 2, 0, &unlockTimeout, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Fill both slots with sessions on different ids
+	cancel1, _, err := s.RWGetDB(int64(1), parentCtx, "slot 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel2, _, err := s.ReadGetDB(int64(2), parentCtx, "slot 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel2()
+
+	// A third session must wait for a slot and fail once its context ends
+	waitCtx, waitCancel := context.WithTimeout(parentCtx, 500*time.Millisecond)
+	_, _, err = s.RWGetDB(int64(3), waitCtx, "over the cap")
+	waitCancel()
+	if err == nil {
+		t.Fatal("third session was admitted over MaxConns")
+	}
+
+	// Releasing a slot must admit a new session
+	cancel1()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ctx, ctxCancel := context.WithTimeout(parentCtx, 500*time.Millisecond)
+		cancel3, db, err := s.RWGetDB(int64(3), ctx, "after release")
+		ctxCancel()
+		if err == nil && db != nil {
+			cancel3()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("session not admitted after slot release: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -251,8 +301,8 @@ func TestNewWithOptionsValidation(t *testing.T) {
 	customConnect := func(ctx context.Context, id interface{}, driverName, dataSourceName string, statementTimeout *time.Duration) (*sqlx.DB, error) {
 		return DefaultConnectDBFunc(ctx, id, driverName, dataSourceName, statementTimeout)
 	}
-	if _, err := NewWithOptions(parentCtx, Options{DriverName: "mock", ConnectDBFunc: customConnect, MaxConns: 1}); err == nil {
-		t.Fatal("expected error for MaxConns with a custom ConnectDBFunc")
+	if _, err := NewWithOptions(parentCtx, Options{DriverName: "mock", ConnectDBFunc: customConnect, MaxConns: 1}); err != nil {
+		t.Fatalf("MaxConns with a custom ConnectDBFunc must be allowed: %v", err)
 	}
 	statementTimeout := time.Minute
 	if _, err := NewWithOptions(parentCtx, Options{DriverName: "sqlite3", StatementTimeout: &statementTimeout}); err == nil {

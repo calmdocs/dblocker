@@ -73,15 +73,14 @@
 //		MaxConnsPerID:  5,
 //	})
 //
-// Both limits count physical database connections.  MaxConnsPerID caps each
-// id's pool via database/sql's SetMaxOpenConns.  MaxConns is enforced at the
-// driver level: every connection holds a slot in a store-wide budget from
-// dial to close, so the total across every id's pool (and every separate
-// session) can never exceed it.  Opening a connection beyond a cap waits
-// until one closes, subject to the request context and the UnlockTimeout.
-// Because MaxConns instruments the driver, it requires the default connect
-// function (Options.ConnectDBFunc must be nil), and connections made by the
-// "mock" test driver are not counted.
+// MaxConnsPerID caps each id's connection pool via database/sql's
+// SetMaxOpenConns.  MaxConns caps concurrent sessions store-wide: dblocker
+// assumes all database access goes through it, and that each session runs
+// one query at a time, so capping concurrent sessions caps concurrent
+// database connections in use.  A session holds its MaxConns slot from when
+// access is granted (after any wait for the id's lock) until its cancel
+// function is called.  A request beyond either cap waits, subject to the
+// request context and the UnlockTimeout.
 //
 // Within the caps, connections are reused rather than churned: a connection
 // freed by one query is handed directly to any waiting request, and

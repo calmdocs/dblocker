@@ -38,11 +38,11 @@ type Store struct {
 	shards        [shardCount]shard
 	connectDBFunc ConnectDBFunc
 
-	// connLimiter bounds the total number of open database connections
-	// across all ids when MaxConns > 0 (nil means no limit).  Every
-	// physical connection holds a slot from dial to close (see
-	// connlimit.go).
-	connLimiter *connLimiter
+	// connSem bounds the total number of concurrent database sessions
+	// across all ids when MaxConns > 0 (nil means no limit).  A slot is
+	// held from when access for a session is granted until the session's
+	// cancel function is called (or its context ends).
+	connSem chan struct{}
 
 	DriverName       string
 	DataSourceName   string
@@ -59,13 +59,14 @@ type Store struct {
 	// The whole pool is closed when the id's last request finishes.
 	MaxConnsPerID int
 
-	// MaxConns caps the total number of concurrent database connections
-	// across all ids.  Opening a connection beyond the cap waits until a
-	// connection closes anywhere in the store, subject to the request
-	// context and the UnlockTimeout.  0 means no limit.
-	//
-	// MaxConns counts physical driver connections, so it requires the
-	// default connect function (Options.ConnectDBFunc must be nil).
+	// MaxConns caps the total number of concurrent database sessions
+	// across all ids.  dblocker assumes all database access goes through
+	// it, and that each session runs one query at a time, so capping
+	// concurrent sessions caps concurrent database connections in use.
+	// A session holds its slot from when access is granted (after any
+	// wait for the id's lock) until its cancel function is called.
+	// Requests beyond the cap wait, subject to the request context and
+	// the UnlockTimeout.  0 means no limit.
 	MaxConns int
 
 	debug bool
@@ -99,10 +100,9 @@ type Options struct {
 	// (which closes the whole pool).  0 means no limit.
 	MaxConnsPerID int
 
-	// MaxConns caps the total number of concurrent database connections
-	// across all ids.  It counts physical driver connections, so it
-	// requires the default connect function (ConnectDBFunc must be nil).
-	// 0 means no limit.
+	// MaxConns caps the total number of concurrent database sessions
+	// across all ids, assuming all database access goes through dblocker
+	// (see Store.MaxConns).  0 means no limit.
 	MaxConns int
 
 	// Debug enables logging of lock acquisition and a ticker for
@@ -286,13 +286,6 @@ func NewWithOptions(ctx context.Context, opts Options) (s *Store, err error) {
 		return nil, fmt.Errorf("dblocker error: MaxConns must not be negative: %d", opts.MaxConns)
 	}
 
-	// MaxConns counts physical driver connections, which requires opening
-	// the database pools ourselves — a custom ConnectDBFunc builds its own
-	// pools, which cannot be instrumented.
-	if opts.MaxConns > 0 && opts.ConnectDBFunc != nil {
-		return nil, fmt.Errorf("dblocker error: MaxConns requires the default connect function (ConnectDBFunc must be nil)")
-	}
-
 	s = &Store{
 		Ctx:              ctx,
 		connectDBFunc:    connectDBFunc,
@@ -305,7 +298,7 @@ func NewWithOptions(ctx context.Context, opts Options) (s *Store, err error) {
 		debug:            opts.Debug,
 	}
 	if opts.MaxConns > 0 {
-		s.connLimiter = newConnLimiter(opts.MaxConns)
+		s.connSem = make(chan struct{}, opts.MaxConns)
 	}
 	for i := range s.shards {
 		s.shards[i].m = make(map[interface{}]*Group)
@@ -313,14 +306,8 @@ func NewWithOptions(ctx context.Context, opts Options) (s *Store, err error) {
 	return s, nil
 }
 
-// connectDB dials the database for id.  When MaxConns is set, connections
-// are opened through the store's connLimiter so that every physical
-// connection counts against the store-wide budget; otherwise the configured
-// connectDBFunc is used directly.
+// connectDB dials the database for id using the configured connectDBFunc.
 func (s *Store) connectDB(ctx context.Context, id interface{}, statementTimeout *time.Duration) (*sqlx.DB, error) {
-	if s.connLimiter != nil {
-		return limitedConnectDB(ctx, s.DriverName, s.DataSourceName, statementTimeout, s.connLimiter)
-	}
 	return s.connectDBFunc(ctx, id, s.DriverName, s.DataSourceName, statementTimeout)
 }
 
@@ -501,6 +488,33 @@ func (s *Store) waitGetDB(id interface{}, accessType string, parentCtx context.C
 			cancel()
 		}
 		return nil, nil, fmt.Errorf("unknown access type error: %s", accessType)
+	}
+
+	// Reserve a session slot if MaxConns is set.  The slot is acquired
+	// only after access for the id is granted (so sessions queued behind
+	// a busy id do not consume budget while they wait) and is released
+	// when the session's context is done — i.e. when the caller calls
+	// cancel, or the UnlockTimeout expires.  Every return path below
+	// either calls cancel() or hands cancel to the caller, so the release
+	// goroutine always fires.
+	if s.connSem != nil {
+		select {
+		case s.connSem <- struct{}{}:
+			go func() {
+				<-ctx.Done()
+				<-s.connSem
+			}()
+		case <-s.Ctx.Done():
+			if cancel != nil {
+				cancel()
+			}
+			return nil, nil, s.Ctx.Err()
+		case <-ctx.Done():
+			if cancel != nil {
+				cancel()
+			}
+			return nil, nil, ctx.Err()
+		}
 	}
 
 	// Get database

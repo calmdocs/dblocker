@@ -34,34 +34,6 @@ func DefaultConnectDBFunc(ctx context.Context, id interface{}, driverName, dataS
 	return db, nil
 }
 
-// limitedConnectDB connects like DefaultConnectDBFunc, but every physical
-// database connection in the returned pool counts against limiter (the
-// store-wide MaxConns budget).  The "mock" driver's pool is created by
-// sqlmock itself and cannot be wrapped, so mock connections are not counted.
-func limitedConnectDB(ctx context.Context, driverName, dataSourceName string, statementTimeout *time.Duration, limiter *connLimiter) (db *sqlx.DB, err error) {
-	switch driverName {
-	case "mock":
-		return DefaultConnectDBFunc(ctx, nil, driverName, dataSourceName, statementTimeout)
-	case "sqlite3", "postgres", "mysql":
-		sqlDB, err := openLimitedDB(driverName, dataSourceName, limiter)
-		if err != nil {
-			return nil, err
-		}
-		db = sqlx.NewDb(sqlDB, driverName)
-		if err := db.PingContext(ctx); err != nil {
-			db.Close()
-			return nil, err
-		}
-	default:
-		return nil, fmt.Errorf("connectDB error: database type not implemented: %s", driverName)
-	}
-	if err := setStatementTimeout(ctx, db, driverName, statementTimeout); err != nil {
-		db.Close()
-		return nil, err
-	}
-	return db, nil
-}
-
 // setStatementTimeout applies statementTimeout to the database session for
 // databases that support it.  A nil statementTimeout is a no-op; a non-nil
 // statementTimeout for a database without statement timeout support is an
