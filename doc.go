@@ -53,19 +53,34 @@
 // https://strebkov.dev/posts/shard-your-locks/).  This is transparent to
 // callers: locking semantics per id are unchanged.
 //
-// # Per-id connection limits
+// # Connection limits
 //
-// Options.MaxOpenConnsPerID and Options.MaxIdleConnsPerID cap the size of
-// each id's database connection pool, bounding the total number of database
-// connections any single id can hold:
+// NewWithConnLimits behaves exactly like New but additionally caps
+// concurrent client sessions across all ids at DefaultMaxClientConns (100)
+// and each individual id's database connection pool at DefaultPoolSize (20)
+// — mirroring pgbouncer's max_client_conn and default_pool_size:
+//
+//	store, err := dblocker.NewWithConnLimits(ctx, "postgres", dsn, false)
+//
+// The existing constructors (New, NewWithUnlockAndStatementTimeouts, and
+// NewWithConnectDBFuncAndTimeouts) are unchanged and apply no limits.
+// Custom limits are available via NewWithConnLimitsAndTimeouts, or via
+// Options.MaxClientConns, Options.MaxOpenConnsPerID, and
+// Options.MaxIdleConnsPerID:
 //
 //	maxConns := 5
 //	store, err := dblocker.NewWithOptions(ctx, dblocker.Options{
 //		DriverName:        "postgres",
 //		DataSourceName:    dsn,
+//		MaxClientConns:    50,
 //		MaxOpenConnsPerID: maxConns,
 //		MaxIdleConnsPerID: maxConns,
 //	})
+//
+// MaxClientConns counts sessions from acquisition until their cancel
+// function is called (or their context ends), including sessions still
+// waiting for an id's lock.  Requests beyond the cap wait for a free slot,
+// subject to their context and the UnlockTimeout.
 //
 // # Drivers
 //

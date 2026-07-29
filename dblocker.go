@@ -16,6 +16,18 @@ import (
 // not nil, should be applied to the session where the database supports it.
 type ConnectDBFunc func(ctx context.Context, id interface{}, driverName, dataSourceName string, statementTimeout *time.Duration) (db *sqlx.DB, err error)
 
+// Default connection limits used by NewWithConnLimits (mirroring pgbouncer's
+// max_client_conn and default_pool_size defaults).
+const (
+	// DefaultMaxClientConns is the default cap on concurrent client
+	// sessions across all ids used by NewWithConnLimits.
+	DefaultMaxClientConns = 100
+
+	// DefaultPoolSize is the default cap on each individual id's database
+	// connection pool used by NewWithConnLimits.
+	DefaultPoolSize = 20
+)
+
 // Store is the dblocker store.
 //
 // The id -> *Group map is split across shardCount independently locked
@@ -26,6 +38,12 @@ type Store struct {
 
 	shards        [shardCount]shard
 	connectDBFunc ConnectDBFunc
+
+	// clientConnCh is a semaphore bounding concurrent client sessions
+	// across all ids when MaxClientConns > 0 (nil means no limit).  A slot
+	// is reserved for the lifetime of each session: from waitGetDB until
+	// the session's context is done (cancel called, or timeout).
+	clientConnCh chan struct{}
 
 	DriverName       string
 	DataSourceName   string
@@ -41,6 +59,12 @@ type Store struct {
 	// each id's database pool.  0 keeps the database/sql default; set it
 	// alongside MaxOpenConnsPerID to bound each id's total footprint.
 	MaxIdleConnsPerID int
+
+	// MaxClientConns caps the number of concurrent client sessions across
+	// all ids (like pgbouncer's max_client_conn).  Requests beyond the cap
+	// wait for a slot, subject to their context and the UnlockTimeout.
+	// 0 means no limit.
+	MaxClientConns int
 
 	debug bool
 }
@@ -73,6 +97,10 @@ type Options struct {
 	// MaxIdleConnsPerID caps the number of idle connections retained in
 	// each id's database pool.  0 keeps the database/sql default.
 	MaxIdleConnsPerID int
+
+	// MaxClientConns caps the number of concurrent client sessions across
+	// all ids (like pgbouncer's max_client_conn).  0 means no limit.
+	MaxClientConns int
 
 	// Debug enables logging of lock acquisition and a ticker for
 	// long-held locks.
@@ -157,6 +185,73 @@ func NewWithConnectDBFuncAndTimeouts(
 	})
 }
 
+// NewWithConnLimits creates a new dblocker Store exactly like New, and
+// additionally caps concurrent client sessions across all ids at
+// DefaultMaxClientConns (100) and each individual id's database connection
+// pool at DefaultPoolSize (20) open and idle connections.
+//
+// Existing constructors (New, NewWithUnlockAndStatementTimeouts, and
+// NewWithConnectDBFuncAndTimeouts) are unchanged and apply no connection
+// limits.
+func NewWithConnLimits(
+	ctx context.Context,
+	driverName string,
+	dataSourceName string,
+	debug bool,
+) (s *Store, err error) {
+
+	// Default timeouts, as in New
+	unlockTimeout := 2 * time.Minute
+	defaultStatementTimeout := 4 * time.Minute
+
+	var statementTimeout *time.Duration
+	switch driverName {
+	case "postgres":
+		statementTimeout = &defaultStatementTimeout
+	case "mysql":
+		statementTimeout = &defaultStatementTimeout
+	default:
+	}
+
+	return NewWithConnLimitsAndTimeouts(
+		ctx,
+		driverName,
+		dataSourceName,
+		DefaultMaxClientConns,
+		DefaultPoolSize,
+		&unlockTimeout,
+		statementTimeout,
+		debug,
+	)
+}
+
+// NewWithConnLimitsAndTimeouts creates a new dblocker Store
+// with maxClientConns capping concurrent client sessions across all ids (0 = no limit);
+// with poolSize capping each individual id's database connection pool (open and idle connections, 0 = no limit);
+// with an unlockTimeout for waiting for access to the database; and
+// with a statemenTimeout for database sessions (returns an error if not nil and the database does not support statement timeouts).
+func NewWithConnLimitsAndTimeouts(
+	ctx context.Context,
+	driverName string,
+	dataSourceName string,
+	maxClientConns int,
+	poolSize int,
+	unlockTimeout *time.Duration,
+	statementTimeout *time.Duration,
+	debug bool,
+) (s *Store, err error) {
+	return NewWithOptions(ctx, Options{
+		DriverName:        driverName,
+		DataSourceName:    dataSourceName,
+		UnlockTimeout:     unlockTimeout,
+		StatementTimeout:  statementTimeout,
+		MaxClientConns:    maxClientConns,
+		MaxOpenConnsPerID: poolSize,
+		MaxIdleConnsPerID: poolSize,
+		Debug:             debug,
+	})
+}
+
 // NewWithOptions creates a new dblocker Store from Options.
 // It returns an error if Options.StatementTimeout is not nil and the database
 // does not support statement timeouts.
@@ -188,6 +283,9 @@ func NewWithOptions(ctx context.Context, opts Options) (s *Store, err error) {
 	if opts.MaxIdleConnsPerID < 0 {
 		return nil, fmt.Errorf("dblocker error: MaxIdleConnsPerID must not be negative: %d", opts.MaxIdleConnsPerID)
 	}
+	if opts.MaxClientConns < 0 {
+		return nil, fmt.Errorf("dblocker error: MaxClientConns must not be negative: %d", opts.MaxClientConns)
+	}
 
 	s = &Store{
 		Ctx:               ctx,
@@ -198,7 +296,11 @@ func NewWithOptions(ctx context.Context, opts Options) (s *Store, err error) {
 		StatementTimeout:  opts.StatementTimeout,
 		MaxOpenConnsPerID: opts.MaxOpenConnsPerID,
 		MaxIdleConnsPerID: opts.MaxIdleConnsPerID,
+		MaxClientConns:    opts.MaxClientConns,
 		debug:             opts.Debug,
+	}
+	if opts.MaxClientConns > 0 {
+		s.clientConnCh = make(chan struct{}, opts.MaxClientConns)
 	}
 	for i := range s.shards {
 		s.shards[i].m = make(map[interface{}]*Group)
@@ -304,7 +406,25 @@ func (s *Store) waitGetDB(id interface{}, accessType string, parentCtx context.C
 		return nil, nil, fmt.Errorf("unknown access type error: %s", accessType)
 	}
 
-	// Cancel context when done
+	// Reserve a client connection slot if MaxClientConns is set.  The slot
+	// is held for the lifetime of the session and released by the watcher
+	// goroutine below when the session context is done (i.e. when the
+	// caller cancels, or the UnlockTimeout expires).  Every return path
+	// after this point either calls cancel() or hands cancel to the
+	// caller, so the watcher always runs and the slot is always released.
+	if s.clientConnCh != nil {
+		select {
+		case s.clientConnCh <- struct{}{}:
+		case <-s.Ctx.Done():
+			ctxCancel()
+			return nil, nil, s.Ctx.Err()
+		case <-ctx.Done():
+			ctxCancel()
+			return nil, nil, ctx.Err()
+		}
+	}
+
+	// Cancel context when done, then release the client connection slot
 	go func() {
 		if s.debug {
 			fmt.Println(fmt.Sprintf("dblocker: %s", accessType), tag)
@@ -317,6 +437,10 @@ func (s *Store) waitGetDB(id interface{}, accessType string, parentCtx context.C
 			ctxCancel()
 		case <-ctx.Done():
 			ctxCancel()
+		}
+
+		if s.clientConnCh != nil {
+			<-s.clientConnCh
 		}
 	}()
 
