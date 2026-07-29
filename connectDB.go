@@ -53,7 +53,7 @@ func DefaultConnectDBFunc(ctx context.Context, id interface{}, driverName, dataS
 func connectDBAndWait(
 	ctx context.Context,
 	id interface{},
-	connectDBFunc func(ctx context.Context, id interface{}, driverName, dataSourceName string, statementTimeout *time.Duration) (db *sqlx.DB, err error),
+	connectDBFunc ConnectDBFunc,
 	driverName string,
 	dataSourceName string,
 	statementTimeout *time.Duration,
