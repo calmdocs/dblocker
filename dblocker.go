@@ -4,26 +4,79 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/jmoiron/sqlx"
 )
 
-// Store is the dblocker store
-type Store struct {
-	sync.Mutex
+// ConnectDBFunc connects to the database identified by driverName and
+// dataSourceName and returns a ready-to-use *sqlx.DB.  The id of the
+// requesting Group is provided so that implementations can, for example,
+// route different ids to different database shards.  statementTimeout, when
+// not nil, should be applied to the session where the database supports it.
+type ConnectDBFunc func(ctx context.Context, id interface{}, driverName, dataSourceName string, statementTimeout *time.Duration) (db *sqlx.DB, err error)
 
+// Store is the dblocker store.
+//
+// The id -> *Group map is split across shardCount independently locked
+// shards so that requests for different ids do not contend on a single
+// store-wide mutex (see shard.go).
+type Store struct {
 	Ctx context.Context
 
-	m             map[interface{}]*Group
-	connectDBFunc func(ctx context.Context, id interface{}, driverName, dataSourceName string, statementTimeout *time.Duration) (db *sqlx.DB, err error)
+	shards        [shardCount]shard
+	connectDBFunc ConnectDBFunc
 
 	DriverName       string
 	DataSourceName   string
 	UnlockTimeout    *time.Duration
 	StatementTimeout *time.Duration
-	debug            bool
+
+	// MaxOpenConnsPerID caps the number of open connections in each id's
+	// database pool (both the shared pool and any separate session opened
+	// with RWGetDBWithTimeout / RWGetDBxWithTimeout).  0 means no limit.
+	MaxOpenConnsPerID int
+
+	// MaxIdleConnsPerID caps the number of idle connections retained in
+	// each id's database pool.  0 keeps the database/sql default; set it
+	// alongside MaxOpenConnsPerID to bound each id's total footprint.
+	MaxIdleConnsPerID int
+
+	debug bool
+}
+
+// Options configures a Store created with NewWithOptions.
+type Options struct {
+	// ConnectDBFunc connects to the database.  nil uses DefaultConnectDBFunc.
+	ConnectDBFunc ConnectDBFunc
+
+	// DriverName is the database/sql driver name (e.g. "sqlite3",
+	// "postgres", "mysql", or "mock").
+	DriverName string
+
+	// DataSourceName is the driver-specific data source name.
+	DataSourceName string
+
+	// UnlockTimeout is the maximum time a request waits for access to an
+	// id's database.  nil means wait until the request context is done.
+	UnlockTimeout *time.Duration
+
+	// StatementTimeout is the per-session statement timeout, applied where
+	// the database supports it (postgres and mysql with the default
+	// ConnectDBFunc).  nil disables it.
+	StatementTimeout *time.Duration
+
+	// MaxOpenConnsPerID caps the number of open connections in each id's
+	// database pool.  0 means no limit.
+	MaxOpenConnsPerID int
+
+	// MaxIdleConnsPerID caps the number of idle connections retained in
+	// each id's database pool.  0 keeps the database/sql default.
+	MaxIdleConnsPerID int
+
+	// Debug enables logging of lock acquisition and a ticker for
+	// long-held locks.
+	Debug bool
 }
 
 // Request is a database access request
@@ -87,38 +140,84 @@ func NewWithUnlockAndStatementTimeouts(
 // with a statemenTimeout for database sessions (returns an error if not nil and the database does not support statement timeouts).
 func NewWithConnectDBFuncAndTimeouts(
 	ctx context.Context,
-	connectDBFunc func(ctx context.Context, id interface{}, driverName, dataSourceName string, statementTimeout *time.Duration) (db *sqlx.DB, err error),
+	connectDBFunc ConnectDBFunc,
 	driverName string,
 	dataSourceName string,
 	unlockTimeout *time.Duration,
 	statementTimeout *time.Duration,
 	debug bool,
 ) (s *Store, err error) {
-
-	// Return an error if statementTimeout is not nil and the database does not support statement timeouts
-	if statementTimeout != nil {
-		switch driverName {
-		case "mock":
-			return nil, fmt.Errorf("connectDB error: statementTimeout for database type not implemented: %s", driverName)
-		case "sqlite3":
-			return nil, fmt.Errorf("connectDB error: statementTimeout for database type not implemented: %s", driverName)
-		case "postgres":
-		case "mysql":
-		default:
-			return nil, fmt.Errorf("connectDB error: database type not implemented: %s", driverName)
-		}
-	}
-
-	return &Store{
-		Ctx:              ctx,
-		m:                make(map[interface{}]*Group),
-		connectDBFunc:    connectDBFunc,
+	return NewWithOptions(ctx, Options{
+		ConnectDBFunc:    connectDBFunc,
 		DriverName:       driverName,
 		DataSourceName:   dataSourceName,
 		UnlockTimeout:    unlockTimeout,
 		StatementTimeout: statementTimeout,
-		debug:            debug,
-	}, nil
+		Debug:            debug,
+	})
+}
+
+// NewWithOptions creates a new dblocker Store from Options.
+// It returns an error if Options.StatementTimeout is not nil and the database
+// does not support statement timeouts.
+func NewWithOptions(ctx context.Context, opts Options) (s *Store, err error) {
+
+	// Use default connectDBFunc unless a custom one is provided
+	connectDBFunc := opts.ConnectDBFunc
+	if connectDBFunc == nil {
+		connectDBFunc = DefaultConnectDBFunc
+	}
+
+	// Return an error if statementTimeout is not nil and the database does not support statement timeouts
+	if opts.StatementTimeout != nil {
+		switch opts.DriverName {
+		case "mock":
+			return nil, fmt.Errorf("connectDB error: statementTimeout for database type not implemented: %s", opts.DriverName)
+		case "sqlite3":
+			return nil, fmt.Errorf("connectDB error: statementTimeout for database type not implemented: %s", opts.DriverName)
+		case "postgres":
+		case "mysql":
+		default:
+			return nil, fmt.Errorf("connectDB error: database type not implemented: %s", opts.DriverName)
+		}
+	}
+
+	if opts.MaxOpenConnsPerID < 0 {
+		return nil, fmt.Errorf("dblocker error: MaxOpenConnsPerID must not be negative: %d", opts.MaxOpenConnsPerID)
+	}
+	if opts.MaxIdleConnsPerID < 0 {
+		return nil, fmt.Errorf("dblocker error: MaxIdleConnsPerID must not be negative: %d", opts.MaxIdleConnsPerID)
+	}
+
+	s = &Store{
+		Ctx:               ctx,
+		connectDBFunc:     connectDBFunc,
+		DriverName:        opts.DriverName,
+		DataSourceName:    opts.DataSourceName,
+		UnlockTimeout:     opts.UnlockTimeout,
+		StatementTimeout:  opts.StatementTimeout,
+		MaxOpenConnsPerID: opts.MaxOpenConnsPerID,
+		MaxIdleConnsPerID: opts.MaxIdleConnsPerID,
+		debug:             opts.Debug,
+	}
+	for i := range s.shards {
+		s.shards[i].m = make(map[interface{}]*Group)
+	}
+	return s, nil
+}
+
+// applyConnLimitsPerID applies the per-id connection limits (if any) to a
+// freshly connected database pool.
+func (s *Store) applyConnLimitsPerID(db *sqlx.DB) {
+	if db == nil {
+		return
+	}
+	if s.MaxOpenConnsPerID > 0 {
+		db.SetMaxOpenConns(s.MaxOpenConnsPerID)
+	}
+	if s.MaxIdleConnsPerID > 0 {
+		db.SetMaxIdleConns(s.MaxIdleConnsPerID)
+	}
 }
 
 // RWGetDB returns a shared copy of a database session (*sql.DB) for the specified id.
@@ -221,30 +320,31 @@ func (s *Store) waitGetDB(id interface{}, accessType string, parentCtx context.C
 		}
 	}()
 
-	// Add new Group to the Store map if required
-	s.Lock()
-	g, ok := s.m[id]
+	// Add new Group to the shard map if required.  Only the shard for this
+	// id is locked, so requests for ids on other shards proceed in parallel.
+	sh := s.shardFor(id)
+	sh.Lock()
+	g, ok := sh.m[id]
 	if !ok {
-		s.m[id] = &Group{
-			requestCount: 0,
-			//DB:		nil,
+		g = &Group{
+			requestCount:  0,
 			rwRequestCh:   make(chan Request),
 			readRequestCh: make(chan Request),
 			dbCh:          make(chan *sqlx.DB),
 		}
-		g = s.m[id]
+		sh.m[id] = g
 		go s.startGroup(id, g)
 	}
 
 	// Increment request count
-	s.m[id].requestCount++
-	s.Unlock()
+	g.requestCount++
+	sh.Unlock()
 
 	// Decrement request count when this function returns
 	defer func() {
-		s.Lock()
-		s.m[id].requestCount--
-		s.Unlock()
+		sh.Lock()
+		g.requestCount--
+		sh.Unlock()
 	}()
 
 	// Send request and wait
@@ -296,6 +396,7 @@ func (s *Store) waitGetDB(id interface{}, accessType string, parentCtx context.C
 			}
 			return nil, nil, err
 		}
+		s.applyConnLimitsPerID(db)
 	case "rw", "read":
 
 		// Get shared database connection (wait)

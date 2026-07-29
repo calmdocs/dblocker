@@ -24,10 +24,14 @@ func (s *Store) startGroup(id interface{}, g *Group) {
 	rwDoneCh := make(chan bool)
 	readDoneCh := make(chan bool)
 
-	// Connect to the database WITHOUT holding the store mutex.  Holding it
-	// here would block every waitGetDB call (for any id) on s.Lock — a plain
+	// All lifecycle state for this id (requestCount, map entry) is guarded
+	// by the shard mutex for this id.
+	sh := s.shardFor(id)
+
+	// Connect to the database WITHOUT holding the shard mutex.  Holding it
+	// here would block every waitGetDB call for ids on this shard — a plain
 	// mutex wait that ignores contexts and the UnlockTimeout — so a database
-	// that stays unopenable would wedge the entire store indefinitely.
+	// that stays unopenable would wedge those ids indefinitely.
 	//
 	// The connect retry window is kept shorter than UnlockTimeout so that
 	// waiters receive the real connect error (via the nil db handed out by
@@ -53,9 +57,12 @@ func (s *Store) startGroup(id interface{}, g *Group) {
 		return
 	}
 
-	s.Lock()
+	// Cap this id's total database connection footprint if configured
+	s.applyConnLimitsPerID(db)
+
+	sh.Lock()
 	g.DB = db
-	s.Unlock()
+	sh.Unlock()
 
 	for {
 
@@ -79,7 +86,7 @@ func (s *Store) startGroup(id interface{}, g *Group) {
 			}
 
 			// Close connection and delete group when done
-			s.Lock()
+			sh.Lock()
 			if g.requestCount == 0 {
 				close(g.rwRequestCh)
 				close(g.readRequestCh)
@@ -89,12 +96,12 @@ func (s *Store) startGroup(id interface{}, g *Group) {
 
 				g.DB.Close()
 				g.DB = nil
-				delete(s.m, id)
+				delete(sh.m, id)
 
-				s.Unlock()
+				sh.Unlock()
 				return
 			}
-			s.Unlock()
+			sh.Unlock()
 
 		// Reading
 		case readCount > 0:
@@ -127,7 +134,7 @@ func (s *Store) startGroup(id interface{}, g *Group) {
 
 				// Close connection and delete group when all read requests are done
 				if readCount == 0 {
-					s.Lock()
+					sh.Lock()
 					if g.requestCount == 0 {
 						close(g.rwRequestCh)
 						close(g.readRequestCh)
@@ -137,12 +144,12 @@ func (s *Store) startGroup(id interface{}, g *Group) {
 
 						g.DB.Close()
 						g.DB = nil
-						delete(s.m, id)
+						delete(sh.m, id)
 
-						s.Unlock()
+						sh.Unlock()
 						return
 					}
-					s.Unlock()
+					sh.Unlock()
 				}
 
 			case <-s.Ctx.Done():
@@ -205,11 +212,12 @@ func (s *Store) startGroup(id interface{}, g *Group) {
 // request count when a waiter gives up (context cancelled) without ever
 // taking a request or a nil db from us.
 func (s *Store) drainFailedGroup(id interface{}, g *Group, rwDoneCh, readDoneCh chan bool) {
+	sh := s.shardFor(id)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
-		s.Lock()
+		sh.Lock()
 		if g.requestCount == 0 {
 			close(g.rwRequestCh)
 			close(g.readRequestCh)
@@ -217,12 +225,12 @@ func (s *Store) drainFailedGroup(id interface{}, g *Group, rwDoneCh, readDoneCh 
 			close(rwDoneCh)
 			close(readDoneCh)
 
-			delete(s.m, id)
+			delete(sh.m, id)
 
-			s.Unlock()
+			sh.Unlock()
 			return
 		}
-		s.Unlock()
+		sh.Unlock()
 
 		select {
 		case <-s.Ctx.Done():
