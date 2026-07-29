@@ -111,10 +111,8 @@
 // session whose statement timeout overrides the store's (nil disables it),
 // for one-off long-running work.
 //
-// Per store: StatementTimeout is a server-side backstop applied to every
-// session (postgres and mysql).  It is added to the data source name, so
-// the server enforces it on every connection the pool dials; note that
-// mysql's max_execution_time applies to SELECT statements only.
+// Per store: StatementTimeout is a server-side backstop applied when a
+// session is connected (postgres and mysql).
 //
 // One contract follows from the UnlockTimeout: a session's lock is
 // automatically released when the UnlockTimeout expires (the escape hatch
