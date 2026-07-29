@@ -65,22 +65,25 @@
 // The existing constructors (New, NewWithUnlockAndStatementTimeouts, and
 // NewWithConnectDBFuncAndTimeouts) are unchanged and apply no limits.
 // Custom limits are available via NewWithConnLimitsAndTimeouts, or via
-// Options.MaxClientConns, Options.MaxOpenConnsPerID, and
-// Options.MaxIdleConnsPerID:
+// Options.MaxClientConns and Options.MaxOpenConnsPerID:
 //
-//	maxConns := 5
 //	store, err := dblocker.NewWithOptions(ctx, dblocker.Options{
 //		DriverName:        "postgres",
 //		DataSourceName:    dsn,
 //		MaxClientConns:    50,
-//		MaxOpenConnsPerID: maxConns,
-//		MaxIdleConnsPerID: maxConns,
+//		MaxOpenConnsPerID: 5,
 //	})
 //
 // MaxClientConns counts sessions from acquisition until their cancel
 // function is called (or their context ends), including sessions still
 // waiting for an id's lock.  Requests beyond the cap wait for a free slot,
 // subject to their context and the UnlockTimeout.
+//
+// Within an id's pool cap, connections are reused rather than churned: a
+// connection freed by one query is handed directly to any waiting request,
+// and otherwise kept open for the id's next request.  The whole pool is
+// closed when the id's last request finishes, so an inactive id holds no
+// connections at all.
 //
 // # Drivers
 //

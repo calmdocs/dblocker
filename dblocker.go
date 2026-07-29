@@ -53,12 +53,12 @@ type Store struct {
 	// MaxOpenConnsPerID caps the number of open connections in each id's
 	// database pool (both the shared pool and any separate session opened
 	// with RWGetDBWithTimeout / RWGetDBxWithTimeout).  0 means no limit.
+	//
+	// Within the cap, connections are reused rather than churned: a freed
+	// connection is handed directly to any waiting request (database/sql
+	// semantics), and otherwise kept for the next request for the same id.
+	// The whole pool is closed when the id's last request finishes.
 	MaxOpenConnsPerID int
-
-	// MaxIdleConnsPerID caps the number of idle connections retained in
-	// each id's database pool.  0 keeps the database/sql default; set it
-	// alongside MaxOpenConnsPerID to bound each id's total footprint.
-	MaxIdleConnsPerID int
 
 	// MaxClientConns caps the number of concurrent client sessions across
 	// all ids (like pgbouncer's max_client_conn).  Requests beyond the cap
@@ -91,12 +91,11 @@ type Options struct {
 	StatementTimeout *time.Duration
 
 	// MaxOpenConnsPerID caps the number of open connections in each id's
-	// database pool.  0 means no limit.
+	// database pool.  Within the cap, connections are reused: freed
+	// connections go directly to waiting requests, or are kept for the
+	// next request for the same id until the id's last request finishes
+	// (which closes the whole pool).  0 means no limit.
 	MaxOpenConnsPerID int
-
-	// MaxIdleConnsPerID caps the number of idle connections retained in
-	// each id's database pool.  0 keeps the database/sql default.
-	MaxIdleConnsPerID int
 
 	// MaxClientConns caps the number of concurrent client sessions across
 	// all ids (like pgbouncer's max_client_conn).  0 means no limit.
@@ -188,7 +187,7 @@ func NewWithConnectDBFuncAndTimeouts(
 // NewWithConnLimits creates a new dblocker Store exactly like New, and
 // additionally caps concurrent client sessions across all ids at
 // DefaultMaxClientConns (100) and each individual id's database connection
-// pool at DefaultPoolSize (20) open and idle connections.
+// pool at DefaultPoolSize (20) connections.
 //
 // Existing constructors (New, NewWithUnlockAndStatementTimeouts, and
 // NewWithConnectDBFuncAndTimeouts) are unchanged and apply no connection
@@ -227,7 +226,7 @@ func NewWithConnLimits(
 
 // NewWithConnLimitsAndTimeouts creates a new dblocker Store
 // with maxClientConns capping concurrent client sessions across all ids (0 = no limit);
-// with poolSize capping each individual id's database connection pool (open and idle connections, 0 = no limit);
+// with poolSize capping each individual id's database connection pool (0 = no limit);
 // with an unlockTimeout for waiting for access to the database; and
 // with a statemenTimeout for database sessions (returns an error if not nil and the database does not support statement timeouts).
 func NewWithConnLimitsAndTimeouts(
@@ -247,7 +246,6 @@ func NewWithConnLimitsAndTimeouts(
 		StatementTimeout:  statementTimeout,
 		MaxClientConns:    maxClientConns,
 		MaxOpenConnsPerID: poolSize,
-		MaxIdleConnsPerID: poolSize,
 		Debug:             debug,
 	})
 }
@@ -280,9 +278,6 @@ func NewWithOptions(ctx context.Context, opts Options) (s *Store, err error) {
 	if opts.MaxOpenConnsPerID < 0 {
 		return nil, fmt.Errorf("dblocker error: MaxOpenConnsPerID must not be negative: %d", opts.MaxOpenConnsPerID)
 	}
-	if opts.MaxIdleConnsPerID < 0 {
-		return nil, fmt.Errorf("dblocker error: MaxIdleConnsPerID must not be negative: %d", opts.MaxIdleConnsPerID)
-	}
 	if opts.MaxClientConns < 0 {
 		return nil, fmt.Errorf("dblocker error: MaxClientConns must not be negative: %d", opts.MaxClientConns)
 	}
@@ -295,7 +290,6 @@ func NewWithOptions(ctx context.Context, opts Options) (s *Store, err error) {
 		UnlockTimeout:     opts.UnlockTimeout,
 		StatementTimeout:  opts.StatementTimeout,
 		MaxOpenConnsPerID: opts.MaxOpenConnsPerID,
-		MaxIdleConnsPerID: opts.MaxIdleConnsPerID,
 		MaxClientConns:    opts.MaxClientConns,
 		debug:             opts.Debug,
 	}
@@ -308,17 +302,18 @@ func NewWithOptions(ctx context.Context, opts Options) (s *Store, err error) {
 	return s, nil
 }
 
-// applyConnLimitsPerID applies the per-id connection limits (if any) to a
-// freshly connected database pool.
+// applyConnLimitsPerID applies the per-id connection limit (if any) to a
+// freshly connected database pool.  The idle limit is set to match the open
+// limit so that, within the cap, connections are reused for the id's next
+// requests rather than closed and re-dialled between bursts; the whole pool
+// is closed when the id's last request finishes.
 func (s *Store) applyConnLimitsPerID(db *sqlx.DB) {
 	if db == nil {
 		return
 	}
 	if s.MaxOpenConnsPerID > 0 {
 		db.SetMaxOpenConns(s.MaxOpenConnsPerID)
-	}
-	if s.MaxIdleConnsPerID > 0 {
-		db.SetMaxIdleConns(s.MaxIdleConnsPerID)
+		db.SetMaxIdleConns(s.MaxOpenConnsPerID)
 	}
 }
 

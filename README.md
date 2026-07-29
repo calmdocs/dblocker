@@ -74,7 +74,6 @@ dbStore, err := dblocker.NewWithOptions(ctx, dblocker.Options{
     StatementTimeout:  &statementTimeout,
     MaxClientConns:    50, // concurrent client session limit across all ids (0 = no limit)
     MaxOpenConnsPerID: 5,  // total db connection limit for each individual id (0 = no limit)
-    MaxIdleConnsPerID: 5,
     Debug:             false,
 })
 ```
@@ -86,7 +85,7 @@ connection limits.
 - **UnlockTimeout** — the maximum time a request waits for access to an id's database.  `nil` means wait until the request context is done.
 - **StatementTimeout** — a per-session statement timeout, applied where the database supports it (postgres and mysql).  Constructors return an error if you set it for a database that does not support it.
 - **MaxClientConns** — caps concurrent client sessions across all ids, like pgbouncer's `max_client_conn`.  A session counts from acquisition until its `cancel()` is called (including time spent waiting for an id's lock); requests beyond the cap wait for a free slot, subject to their context and the `UnlockTimeout`.
-- **MaxOpenConnsPerID / MaxIdleConnsPerID** — cap the size of each id's database connection pool, like pgbouncer's `default_pool_size` (applied to the shared session and to separate sessions created by `RWGetDBWithTimeout`).  This bounds the total number of database connections any single id can hold, so one busy or misbehaving id cannot exhaust the database server's connection limit.
+- **MaxOpenConnsPerID** — caps the size of each id's database connection pool, like pgbouncer's `default_pool_size` (applied to the shared session and to separate sessions created by `RWGetDBWithTimeout`).  This bounds the total number of database connections any single id can hold, so one busy or misbehaving id cannot exhaust the database server's connection limit.  Within the cap, connections are reused rather than churned: a connection freed by one query goes directly to any waiting request, and is otherwise kept open for the id's next request; the whole pool is closed when the id's last request finishes, so an inactive id holds no connections.
 
 ## Example
 

@@ -165,7 +165,6 @@ func TestMaxOpenConnsPerID(t *testing.T) {
 		DataSourceName:    "",
 		UnlockTimeout:     &unlockTimeout,
 		MaxOpenConnsPerID: 3,
-		MaxIdleConnsPerID: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -211,9 +210,6 @@ func TestNewWithConnLimitsDefaults(t *testing.T) {
 	}
 	if s.MaxOpenConnsPerID != 20 {
 		t.Fatalf("MaxOpenConnsPerID = %d, want 20", s.MaxOpenConnsPerID)
-	}
-	if s.MaxIdleConnsPerID != DefaultPoolSize {
-		t.Fatalf("MaxIdleConnsPerID = %d, want %d", s.MaxIdleConnsPerID, DefaultPoolSize)
 	}
 	if cap(s.clientConnCh) != 100 {
 		t.Fatalf("clientConnCh cap = %d, want 100", cap(s.clientConnCh))
@@ -296,9 +292,6 @@ func TestNewWithOptionsValidation(t *testing.T) {
 
 	if _, err := NewWithOptions(parentCtx, Options{DriverName: "mock", MaxOpenConnsPerID: -1}); err == nil {
 		t.Fatal("expected error for negative MaxOpenConnsPerID")
-	}
-	if _, err := NewWithOptions(parentCtx, Options{DriverName: "mock", MaxIdleConnsPerID: -1}); err == nil {
-		t.Fatal("expected error for negative MaxIdleConnsPerID")
 	}
 	if _, err := NewWithOptions(parentCtx, Options{DriverName: "mock", MaxClientConns: -1}); err == nil {
 		t.Fatal("expected error for negative MaxClientConns")

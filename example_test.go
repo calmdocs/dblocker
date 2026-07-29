@@ -68,7 +68,6 @@ func ExampleNewWithOptions() {
 		DriverName:        "mock",
 		DataSourceName:    "",
 		MaxOpenConnsPerID: 3,
-		MaxIdleConnsPerID: 3,
 	})
 	if err != nil {
 		panic(err)
